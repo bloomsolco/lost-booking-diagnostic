@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -273,10 +274,11 @@ Area to pay closest attention to: ${data.focus}`;
   try{
     const res=await fetch("/api/diagnostic",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model:MODEL,max_tokens:1000,system:sys,messages:[{role:"user",content:userMsg}]})
+      body:JSON.stringify({model:MODEL,max_tokens:4000,system:sys,messages:[{role:"user",content:userMsg}]})
     });
     if(!res.ok)throw new Error("Server "+res.status);
     const j=await res.json();
+    if(j.stop_reason==="max_tokens")throw new Error("Response truncated — please try again");
     let txt=(j.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").trim();
     txt=txt.replace(/```json/gi,"").replace(/```/g,"").trim();
     const first=txt.indexOf("{"),last=txt.lastIndexOf("}");
