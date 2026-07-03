@@ -257,7 +257,9 @@ Scoring rubric (total 100): First Impression Clarity 15, Service Clarity 15, Boo
 
 Return ONLY valid minified JSON (no markdown, no code fences, no preamble) matching exactly:
 {"score":<int 0-100>,"rating":"<band label>","interpretation":"<2-3 sentences>","topLeaks":["<leak 1>","<leak 2>","<leak 3>"],"fixFirst":"<one recommendation>","scorecard":[{"category":"First Impression Clarity","score":"<n>/15","working":"<short>","leaking":"<short>"},{"category":"Service Clarity","score":"<n>/15","working":"","leaking":""},{"category":"Booking Path","score":"<n>/20","working":"","leaking":""},{"category":"Trust And Proof","score":"<n>/15","working":"","leaking":""},{"category":"Google Profile Readiness","score":"<n>/15","working":"","leaking":""},{"category":"CTA And Lead Capture","score":"<n>/15","working":"","leaking":""},{"category":"Friction Reduction","score":"<n>/5","working":"","leaking":""}],"leaks":[{"name":"","observed":"","hesitation":"","fix":"","impact":"High|Medium|Low","ease":"Easy|Moderate|Hard"},{...},{...}],"quickWins":["","","","",""],"plan":["Day 1 ...","Day 2 ...","Day 3 ...","Day 4 ...","Day 5 ...","Day 6 ...","Day 7 ..."]}
-The score must equal the sum of the 7 scorecard numerators. Provide exactly 3 leaks, 5 quick wins, 7 plan days.`;
+The score must equal the sum of the 7 scorecard numerators. Provide exactly 3 leaks, 5 quick wins, 7 plan days.
+
+STRICT LENGTH LIMITS (to keep the response complete): interpretation max 45 words. Each scorecard "working"/"leaking" max 10 words. Each leak observed/hesitation/fix max 30 words each. Each quick win max 22 words. Each plan day max 18 words. fixFirst max 40 words. Be concise and concrete. Do not exceed these limits.`;
 
   const userMsg=`Business name: ${data.business}
 Business location: ${data.location}
@@ -274,7 +276,7 @@ Area to pay closest attention to: ${data.focus}`;
   try{
     const res=await fetch("/api/diagnostic",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model:MODEL,max_tokens:4000,system:sys,messages:[{role:"user",content:userMsg}]})
+      body:JSON.stringify({model:MODEL,max_tokens:6000,system:sys,messages:[{role:"user",content:userMsg}]})
     });
     if(!res.ok)throw new Error("Server "+res.status);
     const j=await res.json();
