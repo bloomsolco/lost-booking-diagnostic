@@ -139,6 +139,8 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       <p class="intro-2">No uploads. No screenshots. No logins. No patient information. No analytics. No ad account access.</p>
     </div>
 
+    <div class="q-block" id="licenseBlock" style="border:1.5px solid var(--rose)"><label class="q-label"><span class="q-num">★</span>Your license key <span class="req">*</span></label><p class="q-hint">From your Gumroad receipt after purchase.</p><input type="text" id="license" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX"></div>
+    <div class="q-block" id="verifiedBlock" style="display:none;border:1.5px solid var(--rose);background:var(--wash)"><label class="q-label"><span class="q-num">✓</span>Purchase verified</label><p class="q-hint" style="margin-bottom:0">Your license key was applied automatically from your purchase link. Nothing to enter here.</p></div>
     <div class="q-block"><label class="q-label"><span class="q-num">1.</span>Your name <span class="req">*</span></label><input type="text" id="name"></div>
     <div class="q-block"><label class="q-label"><span class="q-num">2.</span>Email address <span class="req">*</span></label><p class="q-hint">Your diagnostic is delivered here too.</p><input type="email" id="email"></div>
     <div class="q-block"><label class="q-label"><span class="q-num">3.</span>Business name <span class="req">*</span></label><input type="text" id="business"></div>
@@ -188,8 +190,23 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       <label class="choice"><input type="checkbox" id="consent"><span>I understand this is a public-facing conversion diagnostic and does not provide legal, medical, compliance, financial, SEO, analytics, or guaranteed revenue advice.</span></label></div>
 
     <p class="err-msg" id="errMsg">Please complete all required fields marked with *</p>
-    <button class="submit-btn" id="submitBtn" onclick="runDiagnostic()">Generate my Bloom Sol diagnostic</button>
+    <button class="submit-btn" id="submitBtn" onclick="openReview()">Review my answers</button>
+    <p style="text-align:center;font-size:12.5px;color:var(--ink-soft);margin-top:12px;margin-bottom:0">You'll get a chance to check everything before your report is generated.</p>
     <p class="submit-micro">Public links only · Your report renders on screen</p>
+  </div>
+
+  <!-- ===== REVIEW ===== -->
+  <div id="reviewView" style="display:none">
+    <h2 style="font-family:'Cormorant Garamond',serif;font-weight:600;font-size:32px;line-height:1.15;margin:0 0 10px">Check your answers before we run it.</h2>
+    <p style="font-size:15px;color:var(--ink-soft);max-width:56ch;margin:0 0 26px">Your report is generated once from what's below — especially your links. Take ten seconds to make sure they're right.</p>
+    <div id="reviewList" style="border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:22px"></div>
+    <div style="background:var(--wash);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:24px">
+      <p style="font-size:13.5px;color:var(--ink);margin:0"><b>This runs once.</b> After your report generates, these answers are locked. If something needs correcting afterwards, reply to your receipt email and we'll sort it out.</p>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="backToForm()">← Edit my answers</button>
+      <button class="btn-solid" id="confirmBtn" onclick="runDiagnostic()" style="flex:1;min-width:200px;padding:14px 20px;font-size:15px">Generate my diagnostic</button>
+    </div>
   </div>
 
   <!-- ===== LOADING ===== -->
@@ -222,7 +239,7 @@ function radio(n){const e=document.querySelector(`input[name="${n}"]:checked`);r
 function checks(n){return [...document.querySelectorAll(`input[name="${n}"]:checked`)].map(e=>e.value).join(", ");}
 
 function validate(){
-  const req=["name","email","business","location","website","booking","google","service","ideal"];
+  const req=["license","name","email","business","location","website","booking","google","service","ideal"];
   let ok=true;
   req.forEach(id=>{const el=document.getElementById(id);if(!el.value.trim()){el.classList.add("err");ok=false;}else el.classList.remove("err");});
   if(!radio("type")){ok=false;} if(!radio("focus")){ok=false;} if(!checks("problem")){ok=false;}
@@ -236,6 +253,56 @@ function cycleMsgs(){let i=0;document.getElementById("loadMsg").textContent=load
   msgTimer=setInterval(()=>{i=(i+1)%loadMsgs.length;const m=document.getElementById("loadMsg");m.style.opacity=0;
     setTimeout(()=>{m.textContent=loadMsgs[i];m.style.opacity=1;},300);},2600);}
 
+/* ===== Gumroad redirect autofill — reads ?email= and license key from the URL
+   so buyers never type a code. Gumroad appends these on post-purchase redirect. ===== */
+(function(){
+  function boot(){
+    const p=new URLSearchParams(location.search);
+    const key=p.get("license_key")||p.get("license")||p.get("key")||"";
+    const em=p.get("email")||"";
+    if(em){const e=document.getElementById("email");if(e&&!e.value)e.value=em;}
+    if(key){
+      const l=document.getElementById("license");
+      if(l){
+        l.value=key;
+        const lb=document.getElementById("licenseBlock"),vb=document.getElementById("verifiedBlock");
+        if(lb&&vb){lb.style.display="none";vb.style.display="block";}
+      }
+    }
+  }
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",boot);else boot();
+})();
+
+const REVIEW_FIELDS=[
+  ["business","Business name"],["location","Location"],["website","Website URL"],
+  ["booking","Booking URL"],["google","Google Business Profile"],["social","Instagram / social"],
+  ["service","Priority service"],["ideal","Ideal client"],["name","Your name"],["email","Email"]
+];
+
+function openReview(){
+  if(!validate())return;
+  const rows=REVIEW_FIELDS.map(([id,label])=>{
+    const v=val(id)||"<span style='color:var(--ink-soft)'>Not provided</span>";
+    const isLink=/^(website|booking|google|social)$/.test(id);
+    return `<div style="display:flex;gap:14px;padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;align-items:baseline">
+      <div style="flex:0 0 150px;color:var(--ink-soft);font-size:12.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:600">${label}</div>
+      <div style="flex:1;word-break:break-word;${isLink?"color:var(--rose-deep);font-weight:500":""}">${esc(val(id))||"<span style='color:#A99C93'>Not provided</span>"}</div>
+    </div>`;
+  }).join("");
+  document.getElementById("reviewList").innerHTML=rows;
+  document.getElementById("formView").style.display="none";
+  document.getElementById("reviewView").style.display="block";
+  const st=document.getElementById("stepTag");if(st)st.textContent="Review";
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+function backToForm(){
+  document.getElementById("reviewView").style.display="none";
+  document.getElementById("formView").style.display="block";
+  const st=document.getElementById("stepTag");if(st)st.textContent="Intake";
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
 async function runDiagnostic(){
   if(!validate())return;
   const data={
@@ -245,6 +312,7 @@ async function runDiagnostic(){
     problem:checks("problem"),focus:radio("focus")
   };
   document.getElementById("formView").style.display="none";
+  document.getElementById("reviewView").style.display="none";
   document.getElementById("loading").style.display="block";
   document.getElementById("stepTag").textContent="Generating…";
   cycleMsgs();
@@ -276,9 +344,9 @@ Area to pay closest attention to: ${data.focus}`;
   try{
     const res=await fetch("/api/diagnostic",{
       method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model:MODEL,max_tokens:6000,system:sys,messages:[{role:"user",content:userMsg}]})
+      body:JSON.stringify({model:MODEL,max_tokens:6000,system:sys,license_key:val("license"),messages:[{role:"user",content:userMsg}]})
     });
-    if(!res.ok)throw new Error("Server "+res.status);
+    if(!res.ok){let m="Server "+res.status;try{const e=await res.json();if(e.error)m=e.error;}catch(_){}throw new Error(m);}
     const j=await res.json();
     if(j.stop_reason==="max_tokens")throw new Error("Response truncated — please try again");
     let txt=(j.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").trim();
@@ -349,6 +417,7 @@ function restart(){
   document.getElementById("report").style.display="none";
   document.getElementById("doc").style.display="block";
   document.getElementById("failBox").style.display="none";
+  document.getElementById("reviewView").style.display="none";
   document.getElementById("formView").style.display="block";
   document.getElementById("stepTag").textContent="Diagnostic intake";
   window.scrollTo({top:0,behavior:"smooth"});
