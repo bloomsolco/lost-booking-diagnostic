@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 <style>
-:root{--ivory:#FAF6F2;--ivory-2:#F2EAE3;--paper:#FFFFFF;--ink:#3D332F;--ink-soft:#6B5F58;--rose:#C9A09A;--rose-deep:#A87D77;--sage:#8E9A8A;--sage-deep:#6E7A6A;--line:#E6DCD3;--shadow:0 1px 2px rgba(61,51,47,.04),0 10px 30px rgba(61,51,47,.07)}
+:root{--ivory:#FAF6F2;--ivory-2:#F2EAE3;--paper:#FFFFFF;--ink:#3D332F;--ink-soft:#6B5F58;--rose:#C9A09A;--rose-deep:#8B5A5F;--sage:#8E9A8A;--sage-deep:#6E7A6A;--line:#E6DCD3;--shadow:0 1px 2px rgba(61,51,47,.04),0 10px 30px rgba(61,51,47,.07)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Inter',system-ui,sans-serif;color:var(--ink);background:var(--ivory);line-height:1.65;-webkit-font-smoothing:antialiased}
 h1,h2,h3{font-family:'Cormorant Garamond',Georgia,serif;font-weight:600;line-height:1.1;letter-spacing:.005em}
@@ -70,6 +69,14 @@ textarea{resize:vertical;min-height:80px}
 
 /* rendered report doc */
 .doc{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:48px;box-shadow:var(--shadow)}
+.save-banner{display:none;align-items:center;gap:10px;background:var(--ivory-2);border:1px solid var(--rose);border-radius:10px;padding:11px 15px;margin-bottom:16px;font-size:13.5px;color:var(--ink)}
+.save-banner.show{display:flex}
+@media print{
+  nav,.report-bar,.save-banner,.fail{display:none!important}
+  body{background:#fff}
+  .wrap{max-width:none;padding:0;margin:0}
+  .doc{border:none;box-shadow:none;border-radius:0;padding:0}
+}
 .doc .r-head{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:26px}
 .doc .r-head .logo{font-size:20px;margin-bottom:14px}
 .doc h2.r-title{font-size:34px;font-weight:500;margin:6px 0 4px}
@@ -211,7 +218,7 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
 
   <!-- ===== LOADING ===== -->
   <div id="loading">
-    <div class="spin"><svg width="52" height="52" viewBox="0 0 52 52"><circle cx="26" cy="26" r="22" fill="none" stroke="#E6DCD3" stroke-width="5"/><circle cx="26" cy="26" r="22" fill="none" stroke="#A87D77" stroke-width="5" stroke-linecap="round" stroke-dasharray="138" stroke-dashoffset="90"/></svg></div>
+    <div class="spin"><svg width="52" height="52" viewBox="0 0 52 52"><circle cx="26" cy="26" r="22" fill="none" stroke="#E6DCD3" stroke-width="5"/><circle cx="26" cy="26" r="22" fill="none" stroke="#8B5A5F" stroke-width="5" stroke-linecap="round" stroke-dasharray="138" stroke-dashoffset="90"/></svg></div>
     <h2>Reviewing your booking path…</h2>
     <p class="msg" id="loadMsg">Reading your public links</p>
   </div>
@@ -222,9 +229,11 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       <span class="eyebrow">Your diagnostic is ready</span>
       <div class="report-actions">
         <button class="btn-ghost" onclick="restart()">Start over</button>
-        <button class="btn-solid" onclick="downloadPDF()">Download PDF</button>
+        <button class="btn-ghost" onclick="downloadPDF()">Download PDF (backup)</button>
+        <button class="btn-solid" onclick="savePDF()">Save as PDF</button>
       </div>
     </div>
+    <div class="save-banner" id="saveBanner">⚠️ Your report isn't saved yet — tap <b>Save as PDF</b> before you close this tab or switch apps.</div>
     <div class="doc" id="doc"></div>
     <div class="fail" id="failBox"></div>
   </div>
@@ -253,6 +262,33 @@ function cycleMsgs(){let i=0;document.getElementById("loadMsg").textContent=load
   msgTimer=setInterval(()=>{i=(i+1)%loadMsgs.length;const m=document.getElementById("loadMsg");m.style.opacity=0;
     setTimeout(()=>{m.textContent=loadMsgs[i];m.style.opacity=1;},300);},2600);}
 
+/* ===== Report persistence + save-before-you-leave guard =====
+   Mobile browsers frequently kill the tab or fail the html2pdf download silently,
+   losing the report on refresh/close. We (1) cache the last generated report in
+   sessionStorage and restore it on load so a refresh never loses it, and (2) warn
+   the buyer with a banner + beforeunload prompt until they've actually saved it. */
+let reportSaved=false;
+const REPORT_KEY="bsd_last_report";
+
+function cacheReport(r,d){
+  try{sessionStorage.setItem(REPORT_KEY,JSON.stringify({r,d,ts:Date.now()}));}catch(e){}
+}
+function clearCachedReport(){
+  try{sessionStorage.removeItem(REPORT_KEY);}catch(e){}
+}
+function markSaved(){
+  reportSaved=true;
+  const b=document.getElementById("saveBanner");if(b)b.classList.remove("show");
+}
+window.addEventListener("beforeunload",function(e){
+  const reportVisible=document.getElementById("report")&&document.getElementById("report").style.display==="block";
+  if(reportVisible&&!reportSaved){
+    e.preventDefault();
+    e.returnValue="";
+    return "";
+  }
+});
+
 /* ===== Gumroad redirect autofill — reads ?email= and license key from the URL
    so buyers never type a code. Gumroad appends these on post-purchase redirect. ===== */
 (function(){
@@ -269,6 +305,14 @@ function cycleMsgs(){let i=0;document.getElementById("loadMsg").textContent=load
         if(lb&&vb){lb.style.display="none";vb.style.display="block";}
       }
     }
+    // Restore a report lost to refresh/backgrounding this session, if one exists.
+    try{
+      const cached=sessionStorage.getItem(REPORT_KEY);
+      if(cached){
+        const {r,d}=JSON.parse(cached);
+        renderReport(r,d,true);
+      }
+    }catch(e){}
   }
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",boot);else boot();
 })();
@@ -363,7 +407,8 @@ Area to pay closest attention to: ${data.focus}`;
 function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function impactClass(v){v=(v||"").toLowerCase();return v.startsWith("high")?"high":v.startsWith("med")?"med":"low";}
 
-function renderReport(r,d){
+function renderReport(r,d,fromCache){
+  if(!fromCache){reportSaved=false;cacheReport(r,d);}
   const circ=2*Math.PI*52, off=circ*(1-(r.score/100));
   const today=new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
   const rows=r.scorecard.map(s=>{
@@ -382,7 +427,7 @@ function renderReport(r,d){
       <p class="r-prep">Prepared for: <b>${esc(d.business)}</b> · ${esc(d.location)}<br>Prepared by: <b>Bloom Sol Co</b> · ${today}</p>
     </div>
     <div class="score-hero">
-      <div class="score-ring"><svg width="118" height="118" viewBox="0 0 118 118"><circle cx="59" cy="59" r="52" fill="none" stroke="#E6DCD3" stroke-width="10"/><circle cx="59" cy="59" r="52" fill="none" stroke="#A87D77" stroke-width="10" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 59 59)"/></svg><div class="val"><span class="num">${r.score}</span><span class="den">/ 100</span></div></div>
+      <div class="score-ring"><svg width="118" height="118" viewBox="0 0 118 118"><circle cx="59" cy="59" r="52" fill="none" stroke="#E6DCD3" stroke-width="10"/><circle cx="59" cy="59" r="52" fill="none" stroke="#8B5A5F" stroke-width="10" stroke-linecap="round" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 59 59)"/></svg><div class="val"><span class="num">${r.score}</span><span class="den">/ 100</span></div></div>
       <div class="score-copy"><div class="rating">Rating: <b>${esc(r.rating)}</b></div><p>${esc(r.interpretation)}</p></div>
     </div>
     <h3 class="r-sec">Your top 3 booking leaks</h3>
@@ -402,6 +447,8 @@ function renderReport(r,d){
   document.getElementById("loading").style.display="none";
   document.getElementById("report").style.display="block";
   document.getElementById("stepTag").textContent="Diagnostic complete";
+  const banner=document.getElementById("saveBanner");
+  if(banner)banner.classList.toggle("show",!reportSaved);
   window.scrollTo({top:0,behavior:"smooth"});
 }
 
@@ -414,6 +461,7 @@ function showFail(d,err){
 }
 
 function restart(){
+  clearCachedReport();
   document.getElementById("report").style.display="none";
   document.getElementById("doc").style.display="block";
   document.getElementById("failBox").style.display="none";
@@ -423,13 +471,23 @@ function restart(){
   window.scrollTo({top:0,behavior:"smooth"});
 }
 
+/* Primary save path: native browser print-to-PDF. Works reliably on iOS/Android
+   Safari and Chrome, where html2pdf's canvas-render-then-download approach is
+   flaky (silent failures, no visible download, popup blockers). */
+function savePDF(){
+  window.print();
+}
+window.addEventListener("afterprint",markSaved);
+
+/* Backup path: client-side html2pdf render + direct download. Kept for desktop
+   buyers who prefer a one-click file over the print dialog. */
 function downloadPDF(){
   const el=document.getElementById("doc");
   const biz=(val("business")||"diagnostic").replace(/[^a-z0-9]/gi,"-").toLowerCase();
   html2pdf().set({margin:[0.5,0.5,0.5,0.5],filename:`bloom-sol-diagnostic-${biz}.pdf`,
     image:{type:"jpeg",quality:0.98},html2canvas:{scale:2,backgroundColor:"#FFFFFF"},
     jsPDF:{unit:"in",format:"letter",orientation:"portrait"},
-    pagebreak:{mode:["css","legacy"]}}).from(el).save();
+    pagebreak:{mode:["css","legacy"]}}).from(el).save().then(markSaved);
 }
 </script>
 </body>
