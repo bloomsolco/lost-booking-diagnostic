@@ -274,8 +274,7 @@ let reportSaved=false;
 const REPORT_KEY="bsd_last_report";
 
 function cacheReport(r,d,slog){
-  try{sessionStorage.setItem(REPORT_KEY,JSON.stringify({r,d,slog,ts:Date.now()}))
-;}catch(e){}
+  try{sessionStorage.setItem(REPORT_KEY,JSON.stringify({r,d,slog,ts:Date.now()}));}catch(e){}
 }
 function clearCachedReport(){
   try{sessionStorage.removeItem(REPORT_KEY);}catch(e){}
