@@ -227,7 +227,25 @@ function htmlToText(html) {
 
 function looksLoginGated(text) {
   const t = text.slice(0, 2500).toLowerCase();
-  return /(log in|sign in|sign up) to (see|view|continue)|enable javascript|javascript is (required|disabled)|checking your browser|verify you are human|access denied/.test(t);
+  return /(log ?in|sign ?in|sign ?up) to (see|view|continue|use|access)|(log ?in|sign ?in) to [a-z]{1,20} to (see|continue)|create an account to|enable javascript|javascript is (required|disabled)|checking your browser|verify you are human|access denied|you must be logged in|please (log ?in|sign ?in)/.test(t);
+}
+
+/* ---- Auth-path detection (BSC-009 B1) ----
+   Body-text matching alone is not sufficient: platforms serve logged-out interstitials
+   whose wording does not match any phrase list (Instagram's /accounts/login/ page is the
+   observed case). If the FINAL url after redirects sits on a known auth path, the page is
+   a login wall no matter what its body says, and must never be reported as "Reviewed".
+   Checked against the path only — a business page such as /services/login-help is not
+   caught, because the path must BE the auth route rather than merely contain the word. */
+const AUTH_PATH_RE = /^\/(accounts\/(login|signup|emailsignup)|login|log-in|signin|sign-in|signup|sign-up|register|auth|session\/new|oauth\/authorize|u\/\d+\/login)\/?$/i;
+
+function isAuthWallUrl(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch { return false; }
+  if (AUTH_PATH_RE.test(u.pathname)) return true;
+  // Accounts-style hosts (accounts.google.com/...) are auth infrastructure by definition.
+  if (/^accounts\./i.test(u.hostname)) return true;
+  return false;
 }
 
 /* ---- Preview-metadata fallback (PARTIAL) ----
@@ -316,6 +334,13 @@ async function fetchOneSource(label, rawUrl) {
     } catch { entry.reason = "Content could not be read"; return entry; }
 
     const text = htmlToText(raw);
+    // A login wall is never a reviewable source, and its own metadata describes the login
+    // screen rather than the business — so it cannot become PARTIAL either.
+    if (isAuthWallUrl(currentUrl)) {
+      entry.url = currentUrl;
+      entry.reason = "Link leads to a login page; no public content was visible";
+      return entry;
+    }
     if (text.length < MIN_USEFUL_CHARS || looksLoginGated(text)) {
       const preview = extractPreviewMetadata(raw);
       if (preview) {
