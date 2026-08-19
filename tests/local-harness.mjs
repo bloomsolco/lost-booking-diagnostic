@@ -64,6 +64,13 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes("example.net/gprofile")) {
     return new Response("", { status: 302, headers: { location: "https://example.net/signin" } });
   }
+  // Reproduces the CP0 defect: a real logged-out interstitial with plenty of body text
+  // whose wording matches no login phrase list. Must be UNAVAILABLE on the URL path alone.
+  if (u.includes("example.org/accounts/login")) {
+    return html(200, '<html><head><title>Instagram</title><meta property="og:title" content="Instagram"/><meta property="og:description" content="Create an account or log in to Instagram - Share what you are into with the people who get you."/></head><body><h1>Instagram</h1>' +
+      "<p>Phone number, username, or email. Password. Continue with Facebook. Forgot password? Get the app. ".repeat(8) +
+      "<p>Meta About Blog Jobs Help API Privacy Terms Locations Instagram Lite Threads Contact Uploading &amp; Non-Users Meta Verified. English. 2026 Instagram from Meta.</p></body></html>");
+  }
   if (u.includes("example.org/ig-timeout")) {
     const e = new Error("aborted"); e.name = "AbortError"; throw e;
   }
@@ -153,6 +160,20 @@ const gLeak = r.body.report.leaks.find(l => l.name === "Google profile unknown")
 assert("T5i OBSERVED citing unavailable source downgraded to INTAKE-REPORTED", gLeak.basis === "INTAKE-REPORTED" && gLeak.sources.length === 0);
 assert("T5j downgrade recorded in validation notes", r.body.validation_notes.some(n => /downgraded/.test(n)));
 modelReportOverride = null;
+
+/* T5L (BSC-009 B1): auth-path URLs are UNAVAILABLE regardless of body text, and are
+   never citable as an observed source. This is the defect both CP0 runs exposed. */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/accounts/login/?next=/skinful" } });
+const byA = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T5L1 login-path URL never reported as Reviewed", byA.SOCIAL.status === "UNAVAILABLE", `got ${byA.SOCIAL.status}`);
+assert("T5L2 login-path reason is customer-legible", /login page/i.test(byA.SOCIAL.reason));
+assert("T5L3 login page content never sent to the model", !JSON.stringify(anthropicCalls.at(-1)).includes("Forgot password"));
+assert("T5L4 no leak may cite the login-walled source", !r.body.report.leaks.some(l => (l.sources || []).includes("SOCIAL")));
+
+/* T5M: a business page whose path merely resembles auth wording is NOT caught */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/ig" } });
+const byB = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T5M real profile page still classified normally (PARTIAL)", byB.SOCIAL.status === "PARTIAL");
 
 /* T5k: genuine timeout still = UNAVAILABLE */
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/ig-timeout" } });
