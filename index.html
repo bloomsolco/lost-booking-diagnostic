@@ -402,7 +402,7 @@ async function runDiagnostic(){
 function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function impactClass(v){v=(v||"").toLowerCase();return v.startsWith("high")?"high":v.startsWith("med")?"med":"low";}
 
-function sourceName(lbl){return {WEBSITE:"Website",BOOKING:"Booking page",GOOGLE_PROFILE:"Google Business Profile",SOCIAL:"Social profile"}[lbl]||lbl;}
+function sourceName(lbl){if(/^SITE_PAGE_/.test(lbl))return "Site page";return {WEBSITE:"Website",BOOKING:"Booking page",GOOGLE_PROFILE:"Google Business Profile",SOCIAL:"Social profile"}[lbl]||lbl;}
 
 function renderReport(r,d,slog,fromCache){
   slog=slog||[];
