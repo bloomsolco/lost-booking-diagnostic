@@ -71,6 +71,10 @@ globalThis.fetch = async (url, opts = {}) => {
       "<p>Phone number, username, or email. Password. Continue with Facebook. Forgot password? Get the app. ".repeat(8) +
       "<p>Meta About Blog Jobs Help API Privacy Terms Locations Instagram Lite Threads Contact Uploading &amp; Non-Users Meta Verified. English. 2026 Instagram from Meta.</p></body></html>");
   }
+  // Canonical IG profile reached AFTER normalization strips the login wrapper.
+  if (/example\.org\/bayoucityderm\/?$/.test(u)) {
+    return html(200, '<html><head><title>Bayou City Dermatology (@bayoucityderm) • Instagram</title><meta property="og:title" content="Bayou City Dermatology (@bayoucityderm) • Instagram photos and videos"/><meta property="og:description" content="1,204 Followers, 310 Following, 596 Posts - Board-certified dermatology in Houston. Botox · fillers · skin. Call to book."/><meta property="og:site_name" content="Instagram"/></head><body><div id="react-root"></div></body></html>');
+  }
   if (u.includes("example.org/ig-timeout")) {
     const e = new Error("aborted"); e.name = "AbortError"; throw e;
   }
@@ -80,8 +84,21 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes("www.example.com/book")) {
     return html(200, "<html><body><h2>Book an appointment</h2><p>Select a service and provider to continue scheduling your visit.</p>" + "<p>Choose from consultations, injectables, laser and skin treatments across our providers. ".repeat(6) + "</p></body></html>");
   }
+  if (u.includes("example.com/botox")) {
+    return html(200, "<html><body><h1>Botox in Houston</h1><p>Our Botox treatments start at $12 per unit with our lead injector.</p>" + "<p>Wrinkle relaxing for forehead, glabella and crow's feet, performed by a licensed injector. ".repeat(6) + "</p></body></html>");
+  }
+  if (u.includes("example.com/pricing")) {
+    return html(200, "<html><body><h1>Pricing</h1><p>Transparent pricing for every treatment we offer.</p>" + "<p>Consultations are complimentary and membership plans are available monthly. ".repeat(6) + "</p></body></html>");
+  }
+  if (u.includes("example.com/blog")) {
+    return html(200, "<html><body><h1>Blog</h1><p>News and updates from the practice.</p>" + "<p>Seasonal skincare thoughts and staff announcements posted here. ".repeat(6) + "</p></body></html>");
+  }
   if (u.startsWith("https://example.com")) {
-    return html(200, "<html><body><h1>Radiant Med Spa</h1><p>Botox, fillers, facials. Contact us via our form.</p>" + "<p>Located downtown with a full aesthetic service menu and client reviews. ".repeat(8) + "</p></body></html>");
+    return html(200, '<html><body><h1>Radiant Med Spa</h1><p>Botox, fillers, facials. Contact us via our form.</p>' +
+      '<a href="/botox">Botox treatments</a><a href="/pricing">Pricing &amp; specials</a>' +
+      '<a href="/blog">Blog</a><a href="/privacy">Privacy policy</a>' +
+      '<a href="https://elsewhere.example.net/x">Partner site</a>' +
+      "<p>Located downtown with a full aesthetic service menu and client reviews. ".repeat(8) + "</p></body></html>");
   }
   return html(404, "not found");
 };
@@ -163,7 +180,9 @@ modelReportOverride = null;
 
 /* T5L (BSC-009 B1): auth-path URLs are UNAVAILABLE regardless of body text, and are
    never citable as an observed source. This is the defect both CP0 runs exposed. */
-r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/accounts/login/?next=/skinful" } });
+/* Note: a login URL carrying a recoverable handle in ?next= is now normalized to the
+   real profile (see T12). B1 still governs login walls with nothing to recover. */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/accounts/login/" } });
 const byA = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T5L1 login-path URL never reported as Reviewed", byA.SOCIAL.status === "UNAVAILABLE", `got ${byA.SOCIAL.status}`);
 assert("T5L2 login-path reason is customer-legible", /login page/i.test(byA.SOCIAL.reason));
@@ -181,6 +200,41 @@ const byT = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T5k timeout = UNAVAILABLE(Timed out)", byT.SOCIAL.status === "UNAVAILABLE" && byT.SOCIAL.reason === "Timed out");
 anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+
+/* T12 (BSC-010): Instagram login-wall URL is normalized to the canonical profile,
+   so the handle buried in ?next= becomes a readable source instead of a dead end. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
+  social: "https://www.example.org/accounts/login/?next=%2Fbayoucityderm%2F&is_from_rle" } });
+let byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12a login-wall URL normalized to canonical profile", /\/bayoucityderm\/?$/.test(byN.SOCIAL.url), `got ${byN.SOCIAL.url}`);
+assert("T12b normalized profile is citable (PARTIAL)", byN.SOCIAL.status === "PARTIAL");
+assert("T12c bio/follower data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("1,204 Followers"));
+
+/* T12d: a bare handle is accepted too */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "@bayoucityderm" } });
+byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12d bare @handle resolves to a profile URL", /\/bayoucityderm\/?$/.test(byN.SOCIAL.url));
+
+/* T13: a Google Maps SEARCH url is not a profile and must be labelled as such */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
+  google: "https://www.google.com/maps/search/bayou+city+dermatology+houston/@29.74,-95.44,11z" } });
+const byG = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T13a Maps search → UNAVAILABLE", byG.GOOGLE_PROFILE.status === "UNAVAILABLE");
+assert("T13b reason names the real problem", /search, not a business profile/i.test(byG.GOOGLE_PROFILE.reason));
+
+/* T14: deep-page discovery follows service/pricing pages and skips blog/legal */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const deepPages = r.body.source_log.filter(s => /^SITE_PAGE_/.test(s.label));
+const deepUrls = deepPages.map(s => s.url).join(" ");
+assert("T14a deep pages retrieved", deepPages.length > 0 && deepPages.every(s => s.status === "RETRIEVED"), `got ${deepPages.length}`);
+assert("T14b priority-service page followed", /\/botox/.test(deepUrls), deepUrls);
+assert("T14c blog and legal pages skipped", !/\/blog|\/privacy/.test(deepUrls), deepUrls);
+assert("T14d off-domain links never followed", !/elsewhere\.example\.net/.test(deepUrls));
+assert("T14e deep-page content reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("$12 per unit"));
+assert("T14f deep pages capped", deepPages.length <= 2);
+assert("T14g raw html never returned to the client", r.body.source_log.every(s => !("raw" in s)));
 
 /* T6: score arithmetic enforced */
 modelReportOverride = JSON.parse(JSON.stringify(GOOD_REPORT)); modelReportOverride.score = 90; modelReportOverride.rating = "Strong";
