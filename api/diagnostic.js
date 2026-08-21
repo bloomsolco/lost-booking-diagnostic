@@ -26,6 +26,19 @@ const MAX_REDIRECTS = 3;
 const MAX_BODY_BYTES = 600 * 1024;   // per source, raw
 const MAX_SOURCE_CHARS = 9000;       // per source, extracted text passed to the model
 const MIN_USEFUL_CHARS = 180;        // below this, treat as dynamically unreadable
+const PLACES_PHOTO_CAP = 10;         // Google Places returns at most 10 photo refs per place
+
+/* Platforms that redirect datacenter traffic to a login wall no matter how clean the
+   profile URL is (confirmed live for Instagram: the canonical profile 302s straight back
+   to /accounts/login/). Fetching them burns a request to produce an UNAVAILABLE row that
+   reads like a product defect. We skip the fetch, say plainly why, and recover the signal
+   that actually matters — whether the site links to social at all — from the site HTML. */
+const UNREADABLE_SOCIAL_HOST_RE = /(^|\.)(instagram\.com|facebook\.com|tiktok\.com)$/i;
+
+function isUnreadableSocialHost(rawUrl) {
+  try { return UNREADABLE_SOCIAL_HOST_RE.test(new URL(rawUrl).hostname); }
+  catch { return false; }
+}
 
 const SCORECARD_SPEC = [
   ["First Impression Clarity", 15],
@@ -87,9 +100,18 @@ export default async function handler(req, res) {
       { label: "WEBSITE", url: d.website },
       { label: "BOOKING", url: d.booking },
       ...(gbpViaPlaces || googleIsSearch ? [] : [{ label: "GOOGLE_PROFILE", url: d.google }]),
-      ...(social.url ? [{ label: "SOCIAL", url: social.url }] : []),
+      ...(social.url && !isUnreadableSocialHost(social.url) ? [{ label: "SOCIAL", url: social.url }] : []),
     ];
     const fetched = await retrieveSources(fetchList);
+
+    /* Social platforms that block automated review get an explicit, non-defect-sounding
+       row rather than a fetch failure. Findings about social must come from intake. */
+    const socialSkipped = social.url && isUnreadableSocialHost(social.url)
+      ? [{
+          label: "SOCIAL", url: social.url, status: "UNAVAILABLE", text: "",
+          reason: "This platform blocks automated review, so the profile was not opened. Social findings come from your intake answers.",
+        }]
+      : [];
 
     /* A Maps search URL never had profile content to read. Say that, rather than
        reporting a generic Maps blurb as though the profile were reviewed. */
@@ -97,13 +119,21 @@ export default async function handler(req, res) {
       label: "GOOGLE_PROFILE", url: d.google, status: "UNAVAILABLE",
       reason: "Link is a Google Maps search, not a business profile page", text: "",
     } : null);
-    const base = gbpEntry ? [...fetched.slice(0, 2), gbpEntry, ...fetched.slice(2)] : fetched;
+    const withGbp = gbpEntry ? [...fetched.slice(0, 2), gbpEntry, ...fetched.slice(2)] : fetched;
+    const base = [...withGbp, ...socialSkipped];
 
     /* Deep-page discovery (BSC-010): the homepage rarely contains the service and pricing
        language a buyer is actually evaluated on. Follow up to two same-domain pages that
        look like service/pricing/about pages so findings can cite what the clinic really
        says, not merely that a page appears to be missing. */
     const deep = await retrieveDeepPages(base, d);
+
+    /* Fold the site's outbound-social observation into the WEBSITE source text. */
+    const siteEntry = base.find(s => s.label === "WEBSITE" && s.status === "RETRIEVED" && s.raw);
+    if (siteEntry) {
+      siteEntry.text = `${describeSiteSocialLinks(siteEntry.raw)}\n\n${siteEntry.text}`.slice(0, MAX_SOURCE_CHARS);
+    }
+
     const sourceLog = [...base, ...deep];
 
     const fullLabels = sourceLog.filter(s => s.status === "RETRIEVED").map(s => s.label);
@@ -490,6 +520,25 @@ function scoreDeepLink(link, d, baseUrl) {
   return score;
 }
 
+/* ---- Site social-link detection (BSC-010 B4) ----
+   We cannot read the social profile itself, but we CAN observe whether the site points to
+   it at all. "Your homepage never links to your Instagram" is a real, checkable leak for a
+   business whose discovery happens on social — and it costs nothing, since the homepage
+   HTML is already in hand. Appended to the WEBSITE source so it stays properly OBSERVED. */
+const SOCIAL_LINK_PATTERNS = [
+  ["Instagram", /instagram\.com\/[A-Za-z0-9._]/i],
+  ["Facebook", /facebook\.com\/[A-Za-z0-9._]/i],
+  ["TikTok", /tiktok\.com\/@?[A-Za-z0-9._]/i],
+  ["YouTube", /youtube\.com\/(@|channel\/|c\/)/i],
+];
+
+function describeSiteSocialLinks(html) {
+  const found = SOCIAL_LINK_PATTERNS.filter(([, re]) => re.test(html)).map(([n]) => n);
+  return found.length
+    ? `SITE SOCIAL LINKS: the site links out to ${found.join(", ")}.`
+    : "SITE SOCIAL LINKS: no link to any social profile was found anywhere in the homepage HTML.";
+}
+
 async function retrieveDeepPages(base, d) {
   const site = base.find(s => s.label === "WEBSITE" && s.status === "RETRIEVED" && s.raw);
   if (!site) return [];
@@ -567,9 +616,17 @@ async function tryPlacesGbp(d) {
     p.websiteUri ? `Website listed: ${p.websiteUri}` : "Website listed: NO WEBSITE LINK ON PROFILE",
     p.nationalPhoneNumber ? `Phone listed: ${p.nationalPhoneNumber}` : "Phone listed: none",
     (p.regularOpeningHours && Array.isArray(p.regularOpeningHours.weekdayDescriptions) && p.regularOpeningHours.weekdayDescriptions.length)
-      ? `Hours listed: yes — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
+      ? `Hours listed: yes (listed on the profile — we cannot verify they are correct) — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
       : "Hours listed: NO HOURS ON PROFILE",
-    Array.isArray(p.photos) ? `Photos on profile: ${p.photos.length}` : "Photos on profile: none",
+    /* B3 (CP0 live): Places returns AT MOST 10 photo references, so 10 is our API
+       ceiling and not the profile's photo count. Reporting the raw number invented a
+       "only 10 photos" leak for a clinic that had far more. Only a count below the
+       ceiling is real information; at the ceiling we must say we cannot tell. */
+    !Array.isArray(p.photos) || p.photos.length === 0
+      ? "Photos on profile: none found"
+      : p.photos.length >= PLACES_PHOTO_CAP
+        ? `Photos on profile: at least ${PLACES_PHOTO_CAP} — the data source caps this list at ${PLACES_PHOTO_CAP}, so the true total is unknown and may be far higher. Do not describe this profile as having few photos, and do not build a finding on photo count.`
+        : `Photos on profile: ${p.photos.length}`,
   ].filter(Boolean);
 
   return { label: "GOOGLE_PROFILE", url: d.google, status: "RETRIEVED", reason: "", text: lines.join("\n").slice(0, MAX_SOURCE_CHARS) };
@@ -598,6 +655,8 @@ Write findings that could only have been written about THIS business. Name what 
 This is NOT a full marketing strategy, SEO audit, website redesign, legal/medical/compliance review, analytics or ad audit, or revenue forecast. Never guarantee bookings, revenue, rankings, or outcomes. Never invent revenue figures, booking counts, ranking positions, ROI numbers, or performance results. Never state a price, rating, review count, or statistic that does not appear in the retrieved source content. Voice: clear, grounded, commercially sharp, calm, elegant, practical, anti-jargon. Every recommendation ties to booking friction, trust, clarity, confidence, next-step action, local discoverability, or conversion readiness.
 
 EXPERTISE NEVER OVERRIDES EVIDENCE. The industry knowledge above tells you what to look for and how to interpret it. It never licenses a claim about this business that the retrieved sources do not support. When your expertise suggests a likely problem you could not verify, either ground it in the owner's intake answers and label it INTAKE-REPORTED, or leave it out.
+
+NEVER BUILD A FINDING ON A MEASUREMENT CEILING. Some source values are capped by the data source rather than by the business. Where a source says a value is capped, at least, or unknown, treat it as unknown — never as a low number, never as evidence of a deficiency, and never as one of the three leaks.
 
 EVIDENCE RULES — these are strict:
 - The user message contains source content for these sources only: FULL PAGE TEXT for [${fullLabels.join(", ") || "—"}]; PUBLIC PREVIEW METADATA ONLY for [${partialLabels.join(", ") || "—"}]. Sources marked UNAVAILABLE could not be read; you know nothing about their content.
