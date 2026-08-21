@@ -570,6 +570,22 @@ async function retrieveDeepPages(base, d) {
    must confidently match the intake business name, otherwise we discard the result
    and fall back to the normal fetch path (PARTIAL/UNAVAILABLE). Any API error also
    falls back. Absence of the key = exactly the pre-existing behavior. */
+/* ---- B5 (Places audit): location guard ----
+   namesMatch alone is not sufficient. A multi-location brand ("Queen Aesthetics") returns
+   a perfect name match for a DIFFERENT suite, and we would then report another location's
+   rating, review count, hours and address as this owner's profile. That is worse than
+   returning nothing. We therefore also require the resolved address to contain the city
+   the owner gave. Deliberately biased toward false negatives: a nearby-suburb address
+   ("Bellaire" for a Houston intake) is discarded and falls back to UNAVAILABLE, which
+   costs us a source but never attributes a stranger's data to the customer. */
+function locationMatches(address, intakeLocation) {
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const addr = norm(address);
+  const city = norm(String(intakeLocation || "").split(",")[0]);
+  if (!addr || !city) return false;
+  return addr.includes(city);
+}
+
 function namesMatch(a, b) {
   const tok = s => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(w => w.length > 1);
   const A = tok(a), B = tok(b);
@@ -606,6 +622,8 @@ async function tryPlacesGbp(d) {
   if (!p) return null;
   const foundName = p.displayName && p.displayName.text ? p.displayName.text : "";
   if (!namesMatch(foundName, d.business)) return null; // wrong business — never report a stranger's profile
+  // B5: same brand, different location is still the wrong profile for this owner.
+  if (!locationMatches(p.formattedAddress, d.location)) return null;
 
   const lines = [
     "GOOGLE BUSINESS PROFILE — live data via Google Places API:",
@@ -613,11 +631,14 @@ async function tryPlacesGbp(d) {
     p.businessStatus ? `Status: ${p.businessStatus}` : "",
     p.formattedAddress ? `Address: ${p.formattedAddress}` : "",
     (typeof p.rating === "number") ? `Rating: ${p.rating} (${p.userRatingCount || 0} reviews)` : "Rating: none shown on profile",
-    p.websiteUri ? `Website listed: ${p.websiteUri}` : "Website listed: NO WEBSITE LINK ON PROFILE",
+    /* B6: a field absent from the API response does not reliably mean the business
+       omitted it. The previous all-caps framing pushed the model toward a leak — the
+       same mechanism that produced B3. Absent means unknown, not deficient. */
+    p.websiteUri ? `Website listed: ${p.websiteUri}` : "Website listed: not returned by the data source — treat as unknown, not as a missing link.",
     p.nationalPhoneNumber ? `Phone listed: ${p.nationalPhoneNumber}` : "Phone listed: none",
     (p.regularOpeningHours && Array.isArray(p.regularOpeningHours.weekdayDescriptions) && p.regularOpeningHours.weekdayDescriptions.length)
       ? `Hours listed: yes (listed on the profile — we cannot verify they are correct) — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
-      : "Hours listed: NO HOURS ON PROFILE",
+      : "Hours listed: not returned by the data source — treat as unknown, not as missing hours.",
     /* B3 (CP0 live): Places returns AT MOST 10 photo references, so 10 is our API
        ceiling and not the profile's photo count. Reporting the raw number invented a
        "only 10 photos" leak for a clinic that had far more. Only a count below the
