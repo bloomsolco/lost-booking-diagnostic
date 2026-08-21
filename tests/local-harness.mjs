@@ -42,7 +42,7 @@ globalThis.fetch = async (url, opts = {}) => {
     if (!/rating/.test((opts.headers || {})["X-Goog-FieldMask"] || "")) throw new Error("HARNESS: field mask missing");
     if (mode === "error") return json(500, { error: { message: "backend error" } });
     const name = mode === "mismatch" ? "Totally Different Dental Group" : "Radiant Med Spa";
-    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: "123 Main St, Houston, TX", businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: [{ name: "p1" }, { name: "p2" }] }] });
+    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: "123 Main St, Houston, TX", businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: Array.from({ length: 10 }, (_, i) => ({ name: `p${i + 1}` }))  /* Places caps at 10 */ }] });
   }
   if (u.includes("api.gumroad.com")) {
     const params = new URLSearchParams(String(opts.body));
@@ -71,9 +71,11 @@ globalThis.fetch = async (url, opts = {}) => {
       "<p>Phone number, username, or email. Password. Continue with Facebook. Forgot password? Get the app. ".repeat(8) +
       "<p>Meta About Blog Jobs Help API Privacy Terms Locations Instagram Lite Threads Contact Uploading &amp; Non-Users Meta Verified. English. 2026 Instagram from Meta.</p></body></html>");
   }
-  // Canonical IG profile reached AFTER normalization strips the login wrapper.
+  /* B4 (CP0 live): real Instagram 302s the canonical profile straight back to the login
+     wall for datacenter traffic. The old mock returned 200 here, which is why T12 passed
+     against a path that never worked in production. */
   if (/example\.org\/bayoucityderm\/?$/.test(u)) {
-    return html(200, '<html><head><title>Bayou City Dermatology (@bayoucityderm) • Instagram</title><meta property="og:title" content="Bayou City Dermatology (@bayoucityderm) • Instagram photos and videos"/><meta property="og:description" content="1,204 Followers, 310 Following, 596 Posts - Board-certified dermatology in Houston. Botox · fillers · skin. Call to book."/><meta property="og:site_name" content="Instagram"/></head><body><div id="react-root"></div></body></html>');
+    return new Response("", { status: 302, headers: { location: "https://example.org/accounts/login/" } });
   }
   if (u.includes("example.org/ig-timeout")) {
     const e = new Error("aborted"); e.name = "AbortError"; throw e;
@@ -123,6 +125,9 @@ const INTAKE = {
   service: "Botox", ideal: "Professional women 30-55", problem: "Website visitors are not booking", focus: "Booking path",
 };
 async function call(body) { const res = makeRes(); await handler({ method: "POST", headers: { origin: "https://diagnostic.bloomsol.co" }, body }, res); return res; }
+
+function placesModeSetup() { globalThis.__placesMode = () => "match"; process.env.PLACES_API_KEY = "TEST_PLACES_KEY"; }
+function placesModeTeardown() { delete process.env.PLACES_API_KEY; }
 
 let pass = 0, fail = 0;
 function assert(name, cond, extra) { if (cond) { pass++; console.log("PASS  " + name); } else { fail++; console.log("FAIL  " + name + (extra ? " — " + extra : "")); } }
@@ -201,20 +206,46 @@ assert("T5k timeout = UNAVAILABLE(Timed out)", byT.SOCIAL.status === "UNAVAILABL
 anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
 
-/* T12 (BSC-010): Instagram login-wall URL is normalized to the canonical profile,
-   so the handle buried in ?next= becomes a readable source instead of a dead end. */
+/* T12 (BSC-010, revised after CP0 live): Instagram-family hosts are never fetched.
+   They block datacenter traffic, so the honest outcome is a clearly-worded skip rather
+   than a fetch failure that reads like a broken product. */
 anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
-  social: "https://www.example.org/accounts/login/?next=%2Fbayoucityderm%2F&is_from_rle" } });
+  social: "https://www.instagram.com/accounts/login/?next=%2Fqueen.aestheticshtx%2F&is_from_rle" } });
 let byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
-assert("T12a login-wall URL normalized to canonical profile", /\/bayoucityderm\/?$/.test(byN.SOCIAL.url), `got ${byN.SOCIAL.url}`);
-assert("T12b normalized profile is citable (PARTIAL)", byN.SOCIAL.status === "PARTIAL");
-assert("T12c bio/follower data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("1,204 Followers"));
+assert("T12a instagram host is UNAVAILABLE", byN.SOCIAL.status === "UNAVAILABLE");
+assert("T12b reason blames the platform, not our tooling", /blocks automated review/i.test(byN.SOCIAL.reason), byN.SOCIAL.reason);
+assert("T12c reason never reads as a fetch failure", !/timed out|could not be reached|login page/i.test(byN.SOCIAL.reason));
+assert("T12d no leak cites the unread social profile", !r.body.report.leaks.some(l => (l.sources || []).includes("SOCIAL")));
 
-/* T12d: a bare handle is accepted too */
+/* T12e: a bare handle still resolves to instagram.com, and is therefore also skipped
+   rather than fetched — no request is spent on a host we know blocks us. */
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "@bayoucityderm" } });
 byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
-assert("T12d bare @handle resolves to a profile URL", /\/bayoucityderm\/?$/.test(byN.SOCIAL.url));
+assert("T12e bare @handle normalized to instagram.com then skipped", /instagram\.com/.test(byN.SOCIAL.url) && byN.SOCIAL.status === "UNAVAILABLE");
+
+/* T12f: a non-Instagram social URL is still fetched normally (the skip is host-scoped). */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/ig" } });
+byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12f other social hosts still retrieved (PARTIAL)", byN.SOCIAL.status === "PARTIAL");
+
+/* T15 (B3): the Places photo list is capped at 10, so 10 must never be reported as a
+   count. This is the defect the Queen Aesthetics CP0 run exposed. */
+placesModeSetup();
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+let sentP = JSON.stringify(anthropicCalls[0].messages);
+assert("T15a capped photo list never stated as a bare count", !/Photos on profile: 10\b/.test(sentP), "reported 10 as a count");
+assert("T15b capped photo list flagged as a floor with unknown true total", /at least 10/.test(sentP) && /true total is unknown/i.test(sentP));
+assert("T15c model told not to build a finding on photo count", /do not build a finding on photo count/i.test(sentP));
+placesModeTeardown();
+
+/* T16 (B4): the site's outbound social links are observable from the homepage HTML. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const sentSite = JSON.stringify(anthropicCalls[0].messages);
+assert("T16a site social-link observation reaches the model", /SITE SOCIAL LINKS/.test(sentSite));
+assert("T16b absence of social links is stated plainly", /no link to any social profile was found/i.test(sentSite), "site mock has no social links");
 
 /* T13: a Google Maps SEARCH url is not a profile and must be labelled as such */
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
