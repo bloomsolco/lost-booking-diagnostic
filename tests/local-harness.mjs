@@ -42,7 +42,9 @@ globalThis.fetch = async (url, opts = {}) => {
     if (!/rating/.test((opts.headers || {})["X-Goog-FieldMask"] || "")) throw new Error("HARNESS: field mask missing");
     if (mode === "error") return json(500, { error: { message: "backend error" } });
     const name = mode === "mismatch" ? "Totally Different Dental Group" : "Radiant Med Spa";
-    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: "123 Main St, Houston, TX", businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: Array.from({ length: 10 }, (_, i) => ({ name: `p${i + 1}` }))  /* Places caps at 10 */ }] });
+    // B5: same brand, different location — the multi-location trap.
+    const addr = mode === "wronglocation" ? "999 Highway 6, Sugar Land, TX" : "123 Main St, Houston, TX";
+    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: addr, businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: Array.from({ length: 10 }, (_, i) => ({ name: `p${i + 1}` }))  /* Places caps at 10 */ }] });
   }
   if (u.includes("api.gumroad.com")) {
     const params = new URLSearchParams(String(opts.body));
@@ -296,6 +298,30 @@ anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, ideal: "x".repeat(5000), evil_extra: "payload" } });
 assert("T10b oversized field truncated + unknown fields dropped", r.statusCode === 200 && !JSON.stringify(anthropicCalls.at(-1)).includes("payload") && !JSON.stringify(anthropicCalls.at(-1)).includes("x".repeat(801)));
 
+/* T17 (B5): a same-name profile at a DIFFERENT location must be discarded. Reporting
+   another suite's rating and hours as this owner's profile is worse than no data. */
+globalThis.__placesMode = () => "wronglocation";
+process.env.PLACES_API_KEY = "TEST_PLACES_KEY";
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+let byL = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T17a same-name different-city profile discarded", byL.GOOGLE_PROFILE.status === "UNAVAILABLE", `got ${byL.GOOGLE_PROFILE.status}`);
+assert("T17b wrong-location data never reaches the model", !JSON.stringify(anthropicCalls[0].messages).includes("Sugar Land"));
+
+/* T17c: the correct location still resolves normally. */
+globalThis.__placesMode = () => "match";
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+byL = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T17c matching city still RETRIEVED", byL.GOOGLE_PROFILE.status === "RETRIEVED");
+
+/* T18 (B6): absent Places fields are stated as unknown, never as a business deficiency. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const sentA = JSON.stringify(anthropicCalls[0].messages);
+assert("T18a absent hours not shouted as a deficiency", !/NO HOURS ON PROFILE/.test(sentA));
+assert("T18b absent hours framed as unknown", /Hours listed: not returned by the data source/.test(sentA));
+delete process.env.PLACES_API_KEY;
+
 /* T11: optional Google Places retriever for GBP */
 let placesMode = "match"; // match | mismatch | error
 globalThis.__placesMode = () => placesMode;
@@ -304,7 +330,7 @@ anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
 let byP = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T11a key set + name match → GOOGLE_PROFILE RETRIEVED via Places", byP.GOOGLE_PROFILE?.status === "RETRIEVED");
-assert("T11b live profile data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("Rating: 4.7 (132 reviews)") && JSON.stringify(anthropicCalls[0].messages).includes("NO HOURS ON PROFILE"));
+assert("T11b live profile data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("Rating: 4.7 (132 reviews)") && /Hours listed: not returned by the data source/.test(JSON.stringify(anthropicCalls[0].messages)));
 assert("T11c source log preserves the supplied GBP url", byP.GOOGLE_PROFILE.url === INTAKE.google);
 
 placesMode = "mismatch";
