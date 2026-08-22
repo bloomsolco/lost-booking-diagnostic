@@ -6,6 +6,7 @@ let anthropicCalls = [];
 let gumroadMode = "valid"; // valid | invalid | refunded | chargebacked
 let sourceMode = "mixed";  // mixed: website OK, booking OK, google 302->login, social timeout
 let modelReportOverride = null;
+let placesFieldMask = "";
 
 const GOOD_REPORT = {
   score: 61, rating: "Notable friction",
@@ -39,12 +40,13 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes("places.googleapis.com")) {
     const mode = globalThis.__placesMode ? globalThis.__placesMode() : "match";
     if ((opts.headers || {})["X-Goog-Api-Key"] !== "TEST_PLACES_KEY") return json(403, { error: { message: "invalid key" } });
-    if (!/rating/.test((opts.headers || {})["X-Goog-FieldMask"] || "")) throw new Error("HARNESS: field mask missing");
+    placesFieldMask = (opts.headers || {})["X-Goog-FieldMask"] || "";
+    if (!/rating/.test(placesFieldMask)) throw new Error("HARNESS: field mask missing");
     if (mode === "error") return json(500, { error: { message: "backend error" } });
     const name = mode === "mismatch" ? "Totally Different Dental Group" : "Radiant Med Spa";
     // B5: same brand, different location — the multi-location trap.
     const addr = mode === "wronglocation" ? "999 Highway 6, Sugar Land, TX" : "123 Main St, Houston, TX";
-    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: addr, businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: Array.from({ length: 10 }, (_, i) => ({ name: `p${i + 1}` }))  /* Places caps at 10 */ }] });
+    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: addr, businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", }] });
   }
   if (u.includes("api.gumroad.com")) {
     const params = new URLSearchParams(String(opts.body));
@@ -231,15 +233,20 @@ r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://
 byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T12f other social hosts still retrieved (PARTIAL)", byN.SOCIAL.status === "PARTIAL");
 
-/* T15 (B3): the Places photo list is capped at 10, so 10 must never be reported as a
-   count. This is the defect the Queen Aesthetics CP0 run exposed. */
+/* T15 (B7): photo data must NEVER reach the model, at any value. The field is not
+   requested and no photo line is emitted. B3's ceiling rule was insufficient - a count
+   BELOW the ceiling proved equally false ("only 9 photos" for a 303-review clinic). */
 placesModeSetup();
 anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
 let sentP = JSON.stringify(anthropicCalls[0].messages);
-assert("T15a capped photo list never stated as a bare count", !/Photos on profile: 10\b/.test(sentP), "reported 10 as a count");
-assert("T15b capped photo list flagged as a floor with unknown true total", /at least 10/.test(sentP) && /true total is unknown/i.test(sentP));
-assert("T15c model told not to build a finding on photo count", /do not build a finding on photo count/i.test(sentP));
+assert("T15a no photo line reaches the model", !/Photos on profile/i.test(sentP));
+assert("T15b no photo count in any form", !/\bphotos?\b[^\n"]{0,40}\b\d+/i.test(sentP), "photo figure present");
+assert("T15c photos not even requested from Places", !/places\.photos/.test(placesFieldMask));
+assert("T15d real profile data still reaches the model", /Rating: 4\.7 \(132 reviews\)/.test(sentP));
+
+/* T15e (B8): listed details are never described as accurate or verified. */
+assert("T15e model instructed not to assert accuracy", /NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE/.test(anthropicCalls[0].system));
 placesModeTeardown();
 
 /* T16 (B4): the site's outbound social links are observable from the homepage HTML. */
