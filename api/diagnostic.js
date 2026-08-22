@@ -170,7 +170,7 @@ export default async function handler(req, res) {
     } catch (e) {
       return res.status(502).json({ error: "The report could not be read cleanly. Please try again." });
     }
-    const v = validateAndRepairReport(report, citableLabels);
+    const v = validateAndRepairReport(report, citableLabels, sourceLog);
     if (!v.ok) return res.status(422).json({ error: v.error });
 
     return res.status(200).json({
@@ -389,6 +389,23 @@ function extractPreviewMetadata(html) {
   return lines.join("\n");
 }
 
+/* B9: derive a page name a clinic owner would recognise. <title> first, falling back to
+   the final path segment title-cased. Trailing site-name suffixes ("| Clinic Name") are
+   trimmed so the name stays short enough to sit inside a 30-word finding. */
+function pageTitle(html, url) {
+  let t = "";
+  const m = String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (m) t = decodeEntities(m[1]).replace(/\s+/g, " ").split(/\s[|\u2013\u2014-]\s/)[0].trim();
+  if (!t || t.length > 70) {
+    try {
+      const seg = new URL(url).pathname.split("/").filter(Boolean).pop() || "";
+      t = seg.replace(/\.\w+$/, "").replace(/[-_]+/g, " ").trim();
+      t = t ? t.replace(/\b\w/g, c => c.toUpperCase()) : "";
+    } catch { t = ""; }
+  }
+  return t.slice(0, 70);
+}
+
 async function fetchOneSource(label, rawUrl) {
   const entry = { label, url: rawUrl, status: "UNAVAILABLE", reason: "", text: "" };
   let u;
@@ -460,6 +477,9 @@ async function fetchOneSource(label, rawUrl) {
     entry.status = "RETRIEVED";
     entry.reason = "";
     entry.url = currentUrl;
+    /* B9: a readable page name so findings can say "the Botox page" instead of leaking
+       our internal source label into customer-facing copy. */
+    entry.title = pageTitle(raw, currentUrl);
     entry.raw = raw; // kept in-process only for deep-page link discovery; never returned
     entry.text = text.slice(0, MAX_SOURCE_CHARS);
     return entry;
@@ -676,6 +696,8 @@ This is NOT a full marketing strategy, SEO audit, website redesign, legal/medica
 
 EXPERTISE NEVER OVERRIDES EVIDENCE. The industry knowledge above tells you what to look for and how to interpret it. It never licenses a claim about this business that the retrieved sources do not support. When your expertise suggests a likely problem you could not verify, either ground it in the owner's intake answers and label it INTAKE-REPORTED, or leave it out.
 
+NEVER WRITE AN INTERNAL SOURCE LABEL IN CUSTOMER-FACING TEXT. Labels such as WEBSITE, BOOKING, GOOGLE_PROFILE, SOCIAL and SITE_PAGE_1 exist only to tag evidence in the "sources" array. The reader is a clinic owner who has never seen them. In every visible field — interpretation, topLeaks, observed, hesitation, fix, quickWins, plan and the scorecard — refer to a page by its name or its role ("the Botox page", "your booking page", "your Google profile"), never by its label.
+
 NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE. Sources can show that hours, a phone number or an address are PRESENT. They cannot show that those details are correct. Write "listed" or "shown", never "accurate", "correct", "up to date" or "verified". Likewise, when the same figure appears with different values from different sources, do not silently pick one: name the source for each, or use only the retrieved source.
 
 NEVER BUILD A FINDING ON A MEASUREMENT CEILING. Some source values are capped by the data source rather than by the business. Where a source says a value is capped, at least, or unknown, treat it as unknown — never as a low number, never as evidence of a deficiency, and never as one of the three leaks.
@@ -709,7 +731,9 @@ Area to pay closest attention to: ${d.focus}`;
 
   const sourceBlocks = sourceLog.map(s => {
     if (s.status === "RETRIEVED") {
-      return `=== SOURCE ${s.label} — RETRIEVED (${s.url}) ===\n${s.text}\n=== END ${s.label} ===`;
+      // B9: the page NAME is what the customer recognises; the label is internal plumbing.
+      const named = s.title ? `page name: "${s.title}" — ` : "";
+      return `=== SOURCE ${s.label} — RETRIEVED (${named}${s.url}) ===\n${s.text}\n=== END ${s.label} ===`;
     }
     if (s.status === "PARTIAL") {
       return `=== SOURCE ${s.label} — PREVIEW METADATA ONLY (${s.url}) — full page not readable; observe only what this preview shows ===\n${s.text}\n=== END ${s.label} ===`;
@@ -738,7 +762,27 @@ const BANNED_CLAIM_PATTERNS = [
   /\b(double|triple)\s+(your\s+)?(revenue|bookings?|sales)\b/i,
 ];
 
-function validateAndRepairReport(r, citableLabels) {
+/* B9: internal source labels must never appear in customer-facing copy. The prompt
+   forbids it, but prompts are requests, not guarantees - CP0 run #4 shipped "SITE_PAGE_1"
+   into a quick win and two plan days. This rewrites any label that survives into a
+   readable page reference, using the real page name where we captured one. Repair rather
+   than reject: the finding itself is sound, only the wording is wrong. */
+const LABEL_TEXT_RE = /\b(SITE_PAGE_\d+|GOOGLE_PROFILE|WEBSITE|BOOKING|SOCIAL)\b/g;
+
+function scrubSourceLabels(value, nameByLabel) {
+  if (typeof value === "string") {
+    return value.replace(LABEL_TEXT_RE, (lbl) => nameByLabel[lbl] || "that page");
+  }
+  if (Array.isArray(value)) return value.map(v => scrubSourceLabels(v, nameByLabel));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = scrubSourceLabels(v, nameByLabel);
+    return out;
+  }
+  return value;
+}
+
+function validateAndRepairReport(r, citableLabels, sourceLog) {
   const notes = [];
   if (!r || typeof r !== "object") return { ok: false, error: "Report was empty." };
 
@@ -788,6 +832,32 @@ function validateAndRepairReport(r, citableLabels) {
   if (retrieved.size === 0 && r.leaks.some(l => l.basis === "OBSERVED")) {
     return { ok: false, error: "Report failed validation: observation claims with no readable sources." };
   }
+
+  /* Scrub labels from visible fields only. leak.sources deliberately keeps the raw
+     labels - that array drives the badge rendering, not the prose. */
+  const nameByLabel = {};
+  for (const src of (sourceLog || [])) {
+    if (src.title) nameByLabel[src.label] = `the ${src.title} page`;
+    else if (src.label === "GOOGLE_PROFILE") nameByLabel[src.label] = "your Google profile";
+    else if (src.label === "BOOKING") nameByLabel[src.label] = "your booking page";
+    else if (src.label === "WEBSITE") nameByLabel[src.label] = "your website";
+    else if (src.label === "SOCIAL") nameByLabel[src.label] = "your social profile";
+  }
+  const before = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.quickWins, r.plan, r.scorecard, r.leaks.map(l => [l.name, l.observed, l.hesitation, l.fix])]);
+  r.interpretation = scrubSourceLabels(r.interpretation, nameByLabel);
+  r.topLeaks = scrubSourceLabels(r.topLeaks, nameByLabel);
+  r.fixFirst = scrubSourceLabels(r.fixFirst, nameByLabel);
+  r.quickWins = scrubSourceLabels(r.quickWins, nameByLabel);
+  r.plan = scrubSourceLabels(r.plan, nameByLabel);
+  r.scorecard = scrubSourceLabels(r.scorecard, nameByLabel);
+  for (const leak of r.leaks) {
+    leak.name = scrubSourceLabels(leak.name, nameByLabel);
+    leak.observed = scrubSourceLabels(leak.observed, nameByLabel);
+    leak.hesitation = scrubSourceLabels(leak.hesitation, nameByLabel);
+    leak.fix = scrubSourceLabels(leak.fix, nameByLabel);
+  }
+  const after = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.quickWins, r.plan, r.scorecard, r.leaks.map(l => [l.name, l.observed, l.hesitation, l.fix])]);
+  if (before !== after) notes.push("Internal source labels were rewritten as readable page references.");
 
   // Banned outcome claims — no invented revenue/booking/ranking/ROI results.
   const textPool = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.leaks, r.quickWins, r.plan]);
