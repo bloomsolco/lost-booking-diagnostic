@@ -17,7 +17,6 @@ gtag('config', 'G-XN7BTKCT1E');
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 <style>
 :root{--ivory:#FAF6F2;--ivory-2:#F2EAE3;--wash:#F2EAE3;--paper:#FFFFFF;--ink:#3D332F;--ink-soft:#6B5F58;--rose:#C9A09A;--rose-deep:#8B5A5F;--sage:#8E9A8A;--sage-deep:#6E7A6A;--line:#E6DCD3;--shadow:0 1px 2px rgba(61,51,47,.04),0 10px 30px rgba(61,51,47,.07)}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -81,11 +80,19 @@ textarea{resize:vertical;min-height:80px}
 .doc{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:48px;box-shadow:var(--shadow)}
 .save-banner{display:none;align-items:center;gap:10px;background:var(--ivory-2);border:1px solid var(--rose);border-radius:10px;padding:11px 15px;margin-bottom:16px;font-size:13.5px;color:var(--ink)}
 .save-banner.show{display:flex}
+.save-hint{font-size:12.5px;color:var(--ink-soft);margin:-6px 0 14px;text-align:right}
 @media print{
-  nav,.report-bar,.save-banner,.fail{display:none!important}
+  nav,.report-bar,.save-banner,.save-hint,.fail{display:none!important}
   body{background:#fff}
   .wrap{max-width:none;padding:0;margin:0}
   .doc{border:none;box-shadow:none;border-radius:0;padding:0}
+  /* Keep whole units together. Without these a scorecard row or leak card can be
+     sliced across a page boundary, which is what made the old export look broken. */
+  .leak-card,.fixfirst,.note-box,.closing,.score-hero,.day,.qw li,.leak-list li,tr{
+    page-break-inside:avoid;break-inside:avoid}
+  thead{display:table-header-group}
+  h3.r-sec{page-break-after:avoid;break-after:avoid}
+  .r-head{page-break-after:avoid;break-after:avoid}
 }
 .doc .r-head{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:26px}
 .doc .r-head .logo{font-size:20px;margin-bottom:14px}
@@ -239,10 +246,10 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       <span class="eyebrow">Your diagnostic is ready</span>
       <div class="report-actions">
         <button class="btn-ghost" onclick="restart()">Start over</button>
-        <button class="btn-ghost" onclick="downloadPDF()">Download PDF (backup)</button>
         <button class="btn-solid" onclick="savePDF()">Save as PDF</button>
       </div>
     </div>
+    <p class="save-hint">Your print dialog will open. Choose <b>Save as PDF</b> as the destination (on iPhone, tap Share then Save to Files).</p>
     <div class="save-banner" id="saveBanner">⚠️ Your report isn't saved yet — tap <b>Save as PDF</b> before you close this tab or switch apps.</div>
     <div class="doc" id="doc"></div>
     <div class="fail" id="failBox"></div>
@@ -276,8 +283,8 @@ function cycleMsgs(){let i=0;document.getElementById("loadMsg").textContent=load
     setTimeout(()=>{m.textContent=loadMsgs[i];m.style.opacity=1;},300);},2600);}
 
 /* ===== Report persistence + save-before-you-leave guard =====
-   Mobile browsers frequently kill the tab or fail the html2pdf download silently,
-   losing the report on refresh/close. We (1) cache the last generated report in
+   Mobile browsers frequently kill or background the tab, losing the report on
+   refresh or close. We (1) cache the last generated report in
    sessionStorage and restore it on load so a refresh never loses it, and (2) warn
    the buyer with a banner + beforeunload prompt until they've actually saved it. */
 let reportSaved=false;
@@ -482,24 +489,18 @@ function restart(){
   window.scrollTo({top:0,behavior:"smooth"});
 }
 
-/* Primary save path: native browser print-to-PDF. Works reliably on iOS/Android
-   Safari and Chrome, where html2pdf's canvas-render-then-download approach is
-   flaky (silent failures, no visible download, popup blockers). */
+/* Single save path: native browser print-to-PDF.
+   The previous build also shipped an html2pdf "Download PDF (backup)" button. It was
+   removed because it produced a materially worse artifact and forced the buyer to pick
+   a PDF engine: html2pdf rasterises the page to JPEG, so the file was several times
+   larger, the text was neither selectable nor searchable, and it paginated by pixel
+   height - slicing scorecard rows in half. It also failed silently on mobile Safari
+   and Chrome. window.print() produces real vector text at a fraction of the size and
+   respects the page-break rules above. */
 function savePDF(){
   window.print();
 }
 window.addEventListener("afterprint",markSaved);
-
-/* Backup path: client-side html2pdf render + direct download. Kept for desktop
-   buyers who prefer a one-click file over the print dialog. */
-function downloadPDF(){
-  const el=document.getElementById("doc");
-  const biz=(val("business")||"diagnostic").replace(/[^a-z0-9]/gi,"-").toLowerCase();
-  html2pdf().set({margin:[0.5,0.5,0.5,0.5],filename:`bloom-sol-diagnostic-${biz}.pdf`,
-    image:{type:"jpeg",quality:0.98},html2canvas:{scale:2,backgroundColor:"#FFFFFF"},
-    jsPDF:{unit:"in",format:"letter",orientation:"portrait"},
-    pagebreak:{mode:["css","legacy"]}}).from(el).save().then(markSaved);
-}
 </script>
 </body>
 </html>
