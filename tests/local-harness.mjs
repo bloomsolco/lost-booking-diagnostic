@@ -91,7 +91,7 @@ globalThis.fetch = async (url, opts = {}) => {
     return html(200, "<html><body><h2>Book an appointment</h2><p>Select a service and provider to continue scheduling your visit.</p>" + "<p>Choose from consultations, injectables, laser and skin treatments across our providers. ".repeat(6) + "</p></body></html>");
   }
   if (u.includes("example.com/botox")) {
-    return html(200, "<html><body><h1>Botox in Houston</h1><p>Our Botox treatments start at $12 per unit with our lead injector.</p>" + "<p>Wrinkle relaxing for forehead, glabella and crow's feet, performed by a licensed injector. ".repeat(6) + "</p></body></html>");
+    return html(200, "<html><head><title>Botox Treatments | Radiant Med Spa</title></head><body><h1>Botox in Houston</h1><p>Our Botox treatments start at $12 per unit with our lead injector.</p>" + "<p>Wrinkle relaxing for forehead, glabella and crow's feet, performed by a licensed injector. ".repeat(6) + "</p></body></html>");
   }
   if (u.includes("example.com/pricing")) {
     return html(200, "<html><body><h1>Pricing</h1><p>Transparent pricing for every treatment we offer.</p>" + "<p>Consultations are complimentary and membership plans are available monthly. ".repeat(6) + "</p></body></html>");
@@ -275,6 +275,33 @@ assert("T14d off-domain links never followed", !/elsewhere\.example\.net/.test(d
 assert("T14e deep-page content reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("$12 per unit"));
 assert("T14f deep pages capped", deepPages.length <= 2);
 assert("T14g raw html never returned to the client", r.body.source_log.every(s => !("raw" in s)));
+
+/* T19 (B9): internal source labels must never reach the buyer. CP0 run #4 shipped
+   "SITE_PAGE_1" into a quick win and two plan days. The prompt forbids it AND the
+   validator rewrites any that survive - tested here by forcing them into the model output. */
+modelReportOverride = JSON.parse(JSON.stringify(GOOD_REPORT));
+modelReportOverride.quickWins = [
+  "Add a price anchor to SITE_PAGE_1 above the CTA",
+  "Fix the CTA on WEBSITE", "c", "d", "e",
+];
+modelReportOverride.plan = [
+  "Day 1 Update SITE_PAGE_1", "Day 2 Review BOOKING", "Day 3 x", "Day 4 x",
+  "Day 5 x", "Day 6 x", "Day 7 x",
+];
+modelReportOverride.leaks[0].fix = "Add the anchor to SITE_PAGE_1.";
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const visible = JSON.stringify([r.body.report.quickWins, r.body.report.plan, r.body.report.leaks.map(l => l.fix)]);
+assert("T19a no SITE_PAGE label in customer-facing copy", !/SITE_PAGE_\d/.test(visible), visible.slice(0, 120));
+assert("T19b no WEBSITE/BOOKING label in customer-facing copy", !/\b(WEBSITE|BOOKING|GOOGLE_PROFILE|SOCIAL)\b/.test(visible));
+assert("T19c label replaced with the real page name", /Botox Treatments page/i.test(visible), visible.slice(0, 200));
+assert("T19d repair recorded in validation notes", r.body.validation_notes.some(n => /source labels/i.test(n)));
+assert("T19e leak.sources still carries raw labels for badges", r.body.report.leaks.some(l => (l.sources || []).length > 0));
+modelReportOverride = null;
+
+/* T19f: the model is instructed not to write labels in the first place. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+assert("T19f prompt forbids internal labels in visible text", /NEVER WRITE AN INTERNAL SOURCE LABEL/.test(anthropicCalls[0].system));
 
 /* T6: score arithmetic enforced */
 modelReportOverride = JSON.parse(JSON.stringify(GOOD_REPORT)); modelReportOverride.score = 90; modelReportOverride.rating = "Strong";
