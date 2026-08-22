@@ -26,7 +26,6 @@ const MAX_REDIRECTS = 3;
 const MAX_BODY_BYTES = 600 * 1024;   // per source, raw
 const MAX_SOURCE_CHARS = 9000;       // per source, extracted text passed to the model
 const MIN_USEFUL_CHARS = 180;        // below this, treat as dynamically unreadable
-const PLACES_PHOTO_CAP = 10;         // Google Places returns at most 10 photo refs per place
 
 /* Platforms that redirect datacenter traffic to a login wall no matter how clean the
    profile URL is (confirmed live for Instagram: the canonical profile 302s straight back
@@ -565,7 +564,7 @@ async function retrieveDeepPages(base, d) {
 /* ---- Optional Google Places retriever for the GBP source ----
    Enabled only when PLACES_API_KEY is set in Vercel env vars (founder-provisioned,
    quota-capped). One Text Search call resolves the business by name + location and
-   returns live profile data (rating, review count, hours, website, photos) — turning
+   returns live profile data (rating, review count, hours, website) — turning
    GOOGLE_PROFILE into a fully OBSERVED source. Guards: the returned business name
    must confidently match the intake business name, otherwise we discard the result
    and fall back to the normal fetch path (PARTIAL/UNAVAILABLE). Any API error also
@@ -609,7 +608,7 @@ async function tryPlacesGbp(d) {
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": key,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.businessStatus,places.rating,places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,places.regularOpeningHours.weekdayDescriptions,places.photos.name",
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.businessStatus,places.rating,places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,places.regularOpeningHours.weekdayDescriptions",
       },
       body: JSON.stringify({ textQuery: `${d.business} ${d.location}`, pageSize: 1 }),
     });
@@ -639,15 +638,15 @@ async function tryPlacesGbp(d) {
     (p.regularOpeningHours && Array.isArray(p.regularOpeningHours.weekdayDescriptions) && p.regularOpeningHours.weekdayDescriptions.length)
       ? `Hours listed: yes (listed on the profile — we cannot verify they are correct) — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
       : "Hours listed: not returned by the data source — treat as unknown, not as missing hours.",
-    /* B3 (CP0 live): Places returns AT MOST 10 photo references, so 10 is our API
-       ceiling and not the profile's photo count. Reporting the raw number invented a
-       "only 10 photos" leak for a clinic that had far more. Only a count below the
-       ceiling is real information; at the ceiling we must say we cannot tell. */
-    !Array.isArray(p.photos) || p.photos.length === 0
-      ? "Photos on profile: none found"
-      : p.photos.length >= PLACES_PHOTO_CAP
-        ? `Photos on profile: at least ${PLACES_PHOTO_CAP} — the data source caps this list at ${PLACES_PHOTO_CAP}, so the true total is unknown and may be far higher. Do not describe this profile as having few photos, and do not build a finding on photo count.`
-        : `Photos on profile: ${p.photos.length}`,
+    /* B7 (CP0 live, second occurrence): the photo line is GONE, and the field is no
+       longer even requested. Places returns a limited set of place photos; that count is
+       not the profile's photo total and excludes customer-uploaded images, which is most
+       of what a searcher actually sees. B3 tried to fix this with a ceiling rule, but a
+       value BELOW the ceiling is equally unreliable — proven when a clinic with 303
+       reviews was reported as having "only 9 photos". We cannot distinguish "few photos"
+       from "few photos exposed by the API" at ANY value, so the field cannot support a
+       finding and must never reach the model. Do not reintroduce without a source that
+       reports a true profile photo total. */
   ].filter(Boolean);
 
   return { label: "GOOGLE_PROFILE", url: d.google, status: "RETRIEVED", reason: "", text: lines.join("\n").slice(0, MAX_SOURCE_CHARS) };
@@ -668,7 +667,7 @@ You are not a generalist. You are an operator who has diagnosed hundreds of aest
 - PROOF MEANS OUTCOMES. Before/after imagery, specific results, and recent reviews do the persuading. Stock photography of unrelated models actively erodes trust with this audience.
 - A LONG TREATMENT MENU IS A DECISION BURDEN. Twenty services with no guided entry point produces stalling, not choice. "Not sure where to start" is a conversion problem with a known fix: a guided path, quiz, or named first-visit consultation.
 - OFF-SITE BOOKING TOOLS LEAK. Redirects to a third-party scheduler abandon the trust the site just built and offer no re-entry for a visitor who is not ready yet.
-- LOCAL DISCOVERY IS PART OF THE FUNNEL. For appointment-based local businesses the Google profile is often the real homepage. Review recency and volume, photos, hours, and a working booking link carry disproportionate weight.
+- LOCAL DISCOVERY IS PART OF THE FUNNEL. For appointment-based local businesses the Google profile is often the real homepage. Review recency and volume, hours, and a working booking link carry disproportionate weight. (Photo volume is NOT observable through our sources — never comment on it.)
 - REPEAT ECONOMICS MATTER. Many of these services recur. A path that captures one appointment and no way to return leaves most of a client's value uncollected.
 
 Write findings that could only have been written about THIS business. Name what you actually saw: the specific service, the specific page, the specific wording. A finding that would read identically for any clinic is a weak finding — replace it with a sharper one grounded in the retrieved content. Prefer the diagnosis a seasoned operator would reach over the obvious observation anyone could make.
@@ -676,6 +675,8 @@ Write findings that could only have been written about THIS business. Name what 
 This is NOT a full marketing strategy, SEO audit, website redesign, legal/medical/compliance review, analytics or ad audit, or revenue forecast. Never guarantee bookings, revenue, rankings, or outcomes. Never invent revenue figures, booking counts, ranking positions, ROI numbers, or performance results. Never state a price, rating, review count, or statistic that does not appear in the retrieved source content. Voice: clear, grounded, commercially sharp, calm, elegant, practical, anti-jargon. Every recommendation ties to booking friction, trust, clarity, confidence, next-step action, local discoverability, or conversion readiness.
 
 EXPERTISE NEVER OVERRIDES EVIDENCE. The industry knowledge above tells you what to look for and how to interpret it. It never licenses a claim about this business that the retrieved sources do not support. When your expertise suggests a likely problem you could not verify, either ground it in the owner's intake answers and label it INTAKE-REPORTED, or leave it out.
+
+NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE. Sources can show that hours, a phone number or an address are PRESENT. They cannot show that those details are correct. Write "listed" or "shown", never "accurate", "correct", "up to date" or "verified". Likewise, when the same figure appears with different values from different sources, do not silently pick one: name the source for each, or use only the retrieved source.
 
 NEVER BUILD A FINDING ON A MEASUREMENT CEILING. Some source values are capped by the data source rather than by the business. Where a source says a value is capped, at least, or unknown, treat it as unknown — never as a low number, never as evidence of a deficiency, and never as one of the three leaks.
 
