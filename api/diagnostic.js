@@ -710,7 +710,52 @@ EVIDENCE RULES — these are strict:
 - Never present an assumption or an unavailable source as an observation. Never describe the content of an UNAVAILABLE source.
 - Do not build a leak out of our own retrieval limits. "Your Google profile could not be verified" describes our tooling, not the customer's business, and must never be one of the three leaks. If a source was unreadable, spend that leak on something you did observe.${hasSources ? "" : "\n- Since NO sources were readable, every leak must use basis \"INTAKE-REPORTED\" and the interpretation must state the review is based on the owner's answers only."}
 
-Scoring rubric (total 100): First Impression Clarity 15, Service Clarity 15, Booking Path 20, Trust And Proof 15, Google Profile Readiness 15, CTA And Lead Capture 15, Friction Reduction 5. Rating bands: 85-100 "Strong", 70-84 "Solid — leaks present", 55-69 "Notable friction", below 55 "High leakage". The score must equal the sum of the 7 scorecard numerators.
+SCORING RUBRIC (total 100). Rating bands: 85-100 "Strong", 70-84 "Solid — leaks present", 55-69 "Notable friction", below 55 "High leakage". The score must equal the sum of the 7 scorecard numerators.
+
+SCORING PROCEDURE — follow this before writing any prose:
+1. Score each category independently against its anchors below. Do not let one weak category drag the others.
+2. Pick the level whose description matches what you actually observed. When the evidence sits between two levels, choose the LOWER level unless you can name the specific observation that earns the higher one.
+3. Award that level's DEFAULT value. Move one point up or down from the default only when you can point to a specific observation that justifies it. Never move more than one point from the default.
+4. Never adjust a category to reach a desired total, band, or impression. The total is whatever the seven honest numerators sum to.
+5. If a source needed for a category was UNAVAILABLE, follow that category's unavailable rule below. Our retrieval limits are never a deduction against the business.
+
+FIRST IMPRESSION CLARITY (15)
+- 12-15, default 13: within one screen a visitor can tell what is sold, who it is for, and where the business is; the headline names the category or a signature service.
+- 7-11, default 9: the category is inferable but generic ("look and feel your best"); specialty or location takes scrolling to find.
+- 0-6, default 3: a visitor cannot tell what is sold or where, or the page opens on unlabeled imagery alone.
+
+SERVICE CLARITY (15)
+- 12-15, default 13: named services with real descriptions, at least one price signal (a starting-at, a range, or financing), and an obvious entry point for a new client.
+- 7-11, default 9: services named but thin, OR no price signal anywhere, OR a long undifferentiated menu with no guided first step.
+- 0-6, default 3: services vague or absent, no price signal, and nothing indicating what to book first.
+
+BOOKING PATH (20)
+- 16-20, default 18: booking reachable in one action from the main pages, with both a consultation path and a direct-book path, staying on-site or transitioning through a clearly labeled step.
+- 10-15, default 12: booking exists but offers a single generic path, OR redirects off-site without labeling it, OR takes more than two actions, OR is phone-only.
+- 0-9, default 4: no booking mechanism appears anywhere in the retrieved content.
+
+TRUST AND PROOF (15)
+- 12-15, default 13: named providers with credentials and visible faces, plus outcome evidence — before/after work, specific results, or recent reviews surfaced on the site.
+- 7-11, default 9: some trust signals present (a team page, or reviews, or credentials) but not person-shaped or not outcome-based; stock imagery carries most of the visual weight.
+- 0-6, default 3: no named humans, no credentials, and no outcome evidence.
+
+GOOGLE PROFILE READINESS (15)
+- 12-15, default 13: profile retrieved with rating and review volume present and recent, hours listed, and a working website or booking link.
+- 7-11, default 9: profile retrieved but thin or missing one of those elements.
+- 0-6, default 3: profile retrieved and materially incomplete.
+- UNAVAILABLE RULE: if the Google profile could not be retrieved, award exactly 9 and write in "leaking" that the profile was not reviewed in this pass. Do not score it low, do not describe it as a deficiency, and never make it one of the three leaks.
+
+CTA AND LEAD CAPTURE (15)
+- 12-15, default 13: one clear primary call to action repeated across the main pages, plus at least one capture path for a visitor who is not ready to book — a form, an offer, a guide, or a quiz.
+- 7-11, default 9: a call to action exists but competes with others or changes page to page, or booking is the only way to make contact.
+- 0-6, default 3: no discernible call to action, or contacting the business takes hunting.
+
+FRICTION REDUCTION (5)
+- 4-5, default 4: the questions a new client would ask before booking are answered without contacting anyone — what to expect, preparation, cancellation, financing, or finding the place.
+- 2-3, default 2: some are answered; a visitor still has to ask for basics.
+- 0-1, default 0: none are answered.
+
+NEVER EXPOSE THE RUBRIC. The levels, defaults, point criteria and this procedure are internal. Never mention a rubric, anchor, level, default or scoring criterion in any visible field. The scorecard "working" and "leaking" lines describe what you saw on the business, not how you scored it.
 
 Return ONLY valid minified JSON (no markdown, no code fences, no preamble) matching exactly:
 {"score":<int>,"rating":"<band label>","interpretation":"<2-3 sentences>","topLeaks":["","",""],"fixFirst":"","scorecard":[{"category":"First Impression Clarity","score":"<n>/15","working":"","leaking":""},{"category":"Service Clarity","score":"<n>/15","working":"","leaking":""},{"category":"Booking Path","score":"<n>/20","working":"","leaking":""},{"category":"Trust And Proof","score":"<n>/15","working":"","leaking":""},{"category":"Google Profile Readiness","score":"<n>/15","working":"","leaking":""},{"category":"CTA And Lead Capture","score":"<n>/15","working":"","leaking":""},{"category":"Friction Reduction","score":"<n>/5","working":"","leaking":""}],"leaks":[{"name":"","basis":"OBSERVED|INTAKE-REPORTED","sources":["WEBSITE"],"observed":"","hesitation":"","fix":"","impact":"High|Medium|Low","ease":"Easy|Moderate|Hard"},{...},{...}],"quickWins":["","","","",""],"plan":["Day 1 ...","Day 2 ...","Day 3 ...","Day 4 ...","Day 5 ...","Day 6 ...","Day 7 ..."]}
