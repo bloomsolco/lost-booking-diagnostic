@@ -382,5 +382,89 @@ r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
 byP = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T11f no key → pre-existing behavior unchanged", byP.GOOGLE_PROFILE?.status === "UNAVAILABLE");
 
+/* ===================== BSC-012: anchored scoring rubric =====================
+   Root cause of the 61/54/61 spread on identical inputs was an underspecified
+   rubric: the prompt named seven categories and their maxima but gave no
+   criterion for what earns a given number, so the model re-invented the rubric
+   on every run. These tests pin the anchors into the prompt. They verify the
+   INSTRUCTION is present and internally consistent; they cannot measure output
+   variance, which needs real generations against a frozen fixture. */
+process.env.PLACES_API_KEY = "TEST_PLACES_KEY";
+placesMode = "ok";
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const sysPrompt = anthropicCalls[0].system;
+
+assert("T20a rubric declares the scoring procedure", /SCORING PROCEDURE/.test(sysPrompt));
+
+const ANCHORED = [
+  ["FIRST IMPRESSION CLARITY (15)", 13],
+  ["SERVICE CLARITY (15)", 13],
+  ["BOOKING PATH (20)", 18],
+  ["TRUST AND PROOF (15)", 13],
+  ["GOOGLE PROFILE READINESS (15)", 13],
+  ["CTA AND LEAD CAPTURE (15)", 13],
+  ["FRICTION REDUCTION (5)", 4],
+];
+assert("T20b all seven categories carry an anchor block",
+  ANCHORED.every(([h]) => sysPrompt.includes(h)));
+assert("T20c every category names a top-level default value",
+  ANCHORED.every(([h, d]) => {
+    const seg = sysPrompt.slice(sysPrompt.indexOf(h), sysPrompt.indexOf(h) + 400);
+    return new RegExp(`default ${d}\\b`).test(seg);
+  }));
+assert("T20d each category offers exactly three anchor levels",
+  ANCHORED.every(([h]) => {
+    const start = sysPrompt.indexOf(h);
+    const seg = sysPrompt.slice(start, start + 1200);
+    return (seg.match(/, default \d/g) || []).length >= 3;
+  }));
+
+assert("T20e ties resolve DOWN, not up", /choose the LOWER level/.test(sysPrompt));
+assert("T20f movement from default is capped at one point", /Never move more than one point from the default/.test(sysPrompt));
+assert("T20g scores may not be bent to reach a band or total", /Never adjust a category to reach a desired total, band, or impression/.test(sysPrompt));
+assert("T20h categories scored independently", /Score each category independently/.test(sysPrompt));
+
+/* Evidence-integrity interaction: an unreadable Google profile must not become a
+   deduction. This is the B3/B7 rule applied to scoring rather than to findings. */
+assert("T20i unavailable Google profile scores neutral, never as a deficiency",
+  /UNAVAILABLE RULE/.test(sysPrompt) && /award exactly 9/.test(sysPrompt)
+  && /never make it one of the three leaks/.test(sysPrompt));
+
+/* The rubric is internal. It must never surface in buyer-facing copy. */
+assert("T20j prompt forbids exposing the rubric to the reader",
+  /NEVER EXPOSE THE RUBRIC/.test(sysPrompt));
+
+/* No silent drift: maxima, bands and the validator spec must be untouched. */
+assert("T20k maxima and bands unchanged by the anchor work",
+  /85-100 "Strong"/.test(sysPrompt) && /70-84 "Solid — leaks present"/.test(sysPrompt)
+  && /55-69 "Notable friction"/.test(sysPrompt) && /below 55 "High leakage"/.test(sysPrompt)
+  && /FIRST IMPRESSION CLARITY \(15\)/.test(sysPrompt) && /BOOKING PATH \(20\)/.test(sysPrompt)
+  && /FRICTION REDUCTION \(5\)/.test(sysPrompt));
+
+/* The anchor scale must map sensibly onto the existing bands: a clinic sitting at
+   the top level of every category should read "Strong", the middle level should read
+   "Notable friction", the bottom level "High leakage". If these drift out of their
+   bands the anchors would silently re-scale the product's headline. */
+const bandOf = n => n >= 85 ? "Strong" : n >= 70 ? "Solid" : n >= 55 ? "Notable friction" : "High leakage";
+const topSum = 13 + 13 + 18 + 13 + 13 + 13 + 4;   // 87
+const midSum = 9 + 9 + 12 + 9 + 9 + 9 + 2;        // 59
+const lowSum = 3 + 3 + 4 + 3 + 3 + 3 + 0;         // 19
+assert("T20l anchor defaults land in the intended bands (top/mid/low)",
+  bandOf(topSum) === "Strong" && bandOf(midSum) === "Notable friction" && bandOf(lowSum) === "High leakage");
+
+/* One variable at a time: BSC-012 recommended anchors as PRIMARY and lower
+   temperature only as the FALLBACK. Temperature must not have moved here, or the
+   fixture test cannot attribute any change. */
+assert("T20m temperature unchanged at 0.4 — anchors are the only variable",
+  anthropicCalls[0].temperature === 0.4);
+
+/* The prior integrity guards must survive the rubric rewrite. */
+assert("T20n B7/B8/B9 guards still present alongside the anchors",
+  /NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE/.test(sysPrompt)
+  && /NEVER BUILD A FINDING ON A MEASUREMENT CEILING/.test(sysPrompt)
+  && /NEVER WRITE AN INTERNAL SOURCE LABEL/.test(sysPrompt));
+delete process.env.PLACES_API_KEY;
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
