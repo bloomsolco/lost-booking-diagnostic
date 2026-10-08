@@ -6,6 +6,7 @@ let anthropicCalls = [];
 let gumroadMode = "valid"; // valid | invalid | refunded | chargebacked
 let sourceMode = "mixed";  // mixed: website OK, booking OK, google 302->login, social timeout
 let modelReportOverride = null;
+let placesFieldMask = "";
 
 const GOOD_REPORT = {
   score: 61, rating: "Notable friction",
@@ -39,10 +40,13 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes("places.googleapis.com")) {
     const mode = globalThis.__placesMode ? globalThis.__placesMode() : "match";
     if ((opts.headers || {})["X-Goog-Api-Key"] !== "TEST_PLACES_KEY") return json(403, { error: { message: "invalid key" } });
-    if (!/rating/.test((opts.headers || {})["X-Goog-FieldMask"] || "")) throw new Error("HARNESS: field mask missing");
+    placesFieldMask = (opts.headers || {})["X-Goog-FieldMask"] || "";
+    if (!/rating/.test(placesFieldMask)) throw new Error("HARNESS: field mask missing");
     if (mode === "error") return json(500, { error: { message: "backend error" } });
     const name = mode === "mismatch" ? "Totally Different Dental Group" : "Radiant Med Spa";
-    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: "123 Main St, Houston, TX", businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", photos: [{ name: "p1" }, { name: "p2" }] }] });
+    // B5: same brand, different location — the multi-location trap.
+    const addr = mode === "wronglocation" ? "999 Highway 6, Sugar Land, TX" : "123 Main St, Houston, TX";
+    return json(200, { places: [{ id: "pid1", displayName: { text: name }, formattedAddress: addr, businessStatus: "OPERATIONAL", rating: 4.7, userRatingCount: 132, websiteUri: "https://example.com", nationalPhoneNumber: "(713) 555-0100", }] });
   }
   if (u.includes("api.gumroad.com")) {
     const params = new URLSearchParams(String(opts.body));
@@ -71,6 +75,12 @@ globalThis.fetch = async (url, opts = {}) => {
       "<p>Phone number, username, or email. Password. Continue with Facebook. Forgot password? Get the app. ".repeat(8) +
       "<p>Meta About Blog Jobs Help API Privacy Terms Locations Instagram Lite Threads Contact Uploading &amp; Non-Users Meta Verified. English. 2026 Instagram from Meta.</p></body></html>");
   }
+  /* B4 (CP0 live): real Instagram 302s the canonical profile straight back to the login
+     wall for datacenter traffic. The old mock returned 200 here, which is why T12 passed
+     against a path that never worked in production. */
+  if (/example\.org\/bayoucityderm\/?$/.test(u)) {
+    return new Response("", { status: 302, headers: { location: "https://example.org/accounts/login/" } });
+  }
   if (u.includes("example.org/ig-timeout")) {
     const e = new Error("aborted"); e.name = "AbortError"; throw e;
   }
@@ -80,8 +90,21 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.includes("www.example.com/book")) {
     return html(200, "<html><body><h2>Book an appointment</h2><p>Select a service and provider to continue scheduling your visit.</p>" + "<p>Choose from consultations, injectables, laser and skin treatments across our providers. ".repeat(6) + "</p></body></html>");
   }
+  if (u.includes("example.com/botox")) {
+    return html(200, "<html><head><title>Botox Treatments | Radiant Med Spa</title></head><body><h1>Botox in Houston</h1><p>Our Botox treatments start at $12 per unit with our lead injector.</p>" + "<p>Wrinkle relaxing for forehead, glabella and crow's feet, performed by a licensed injector. ".repeat(6) + "</p></body></html>");
+  }
+  if (u.includes("example.com/pricing")) {
+    return html(200, "<html><body><h1>Pricing</h1><p>Transparent pricing for every treatment we offer.</p>" + "<p>Consultations are complimentary and membership plans are available monthly. ".repeat(6) + "</p></body></html>");
+  }
+  if (u.includes("example.com/blog")) {
+    return html(200, "<html><body><h1>Blog</h1><p>News and updates from the practice.</p>" + "<p>Seasonal skincare thoughts and staff announcements posted here. ".repeat(6) + "</p></body></html>");
+  }
   if (u.startsWith("https://example.com")) {
-    return html(200, "<html><body><h1>Radiant Med Spa</h1><p>Botox, fillers, facials. Contact us via our form.</p>" + "<p>Located downtown with a full aesthetic service menu and client reviews. ".repeat(8) + "</p></body></html>");
+    return html(200, '<html><body><h1>Radiant Med Spa</h1><p>Botox, fillers, facials. Contact us via our form.</p>' +
+      '<a href="/botox">Botox treatments</a><a href="/pricing">Pricing &amp; specials</a>' +
+      '<a href="/blog">Blog</a><a href="/privacy">Privacy policy</a>' +
+      '<a href="https://elsewhere.example.net/x">Partner site</a>' +
+      "<p>Located downtown with a full aesthetic service menu and client reviews. ".repeat(8) + "</p></body></html>");
   }
   return html(404, "not found");
 };
@@ -106,6 +129,9 @@ const INTAKE = {
   service: "Botox", ideal: "Professional women 30-55", problem: "Website visitors are not booking", focus: "Booking path",
 };
 async function call(body) { const res = makeRes(); await handler({ method: "POST", headers: { origin: "https://diagnostic.bloomsol.co" }, body }, res); return res; }
+
+function placesModeSetup() { globalThis.__placesMode = () => "match"; process.env.PLACES_API_KEY = "TEST_PLACES_KEY"; }
+function placesModeTeardown() { delete process.env.PLACES_API_KEY; }
 
 let pass = 0, fail = 0;
 function assert(name, cond, extra) { if (cond) { pass++; console.log("PASS  " + name); } else { fail++; console.log("FAIL  " + name + (extra ? " — " + extra : "")); } }
@@ -163,7 +189,9 @@ modelReportOverride = null;
 
 /* T5L (BSC-009 B1): auth-path URLs are UNAVAILABLE regardless of body text, and are
    never citable as an observed source. This is the defect both CP0 runs exposed. */
-r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/accounts/login/?next=/skinful" } });
+/* Note: a login URL carrying a recoverable handle in ?next= is now normalized to the
+   real profile (see T12). B1 still governs login walls with nothing to recover. */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/accounts/login/" } });
 const byA = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T5L1 login-path URL never reported as Reviewed", byA.SOCIAL.status === "UNAVAILABLE", `got ${byA.SOCIAL.status}`);
 assert("T5L2 login-path reason is customer-legible", /login page/i.test(byA.SOCIAL.reason));
@@ -181,6 +209,99 @@ const byT = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T5k timeout = UNAVAILABLE(Timed out)", byT.SOCIAL.status === "UNAVAILABLE" && byT.SOCIAL.reason === "Timed out");
 anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+
+/* T12 (BSC-010, revised after CP0 live): Instagram-family hosts are never fetched.
+   They block datacenter traffic, so the honest outcome is a clearly-worded skip rather
+   than a fetch failure that reads like a broken product. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
+  social: "https://www.instagram.com/accounts/login/?next=%2Fqueen.aestheticshtx%2F&is_from_rle" } });
+let byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12a instagram host is UNAVAILABLE", byN.SOCIAL.status === "UNAVAILABLE");
+assert("T12b reason blames the platform, not our tooling", /blocks automated review/i.test(byN.SOCIAL.reason), byN.SOCIAL.reason);
+assert("T12c reason never reads as a fetch failure", !/timed out|could not be reached|login page/i.test(byN.SOCIAL.reason));
+assert("T12d no leak cites the unread social profile", !r.body.report.leaks.some(l => (l.sources || []).includes("SOCIAL")));
+
+/* T12e: a bare handle still resolves to instagram.com, and is therefore also skipped
+   rather than fetched — no request is spent on a host we know blocks us. */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "@bayoucityderm" } });
+byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12e bare @handle normalized to instagram.com then skipped", /instagram\.com/.test(byN.SOCIAL.url) && byN.SOCIAL.status === "UNAVAILABLE");
+
+/* T12f: a non-Instagram social URL is still fetched normally (the skip is host-scoped). */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, social: "https://example.org/ig" } });
+byN = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T12f other social hosts still retrieved (PARTIAL)", byN.SOCIAL.status === "PARTIAL");
+
+/* T15 (B7): photo data must NEVER reach the model, at any value. The field is not
+   requested and no photo line is emitted. B3's ceiling rule was insufficient - a count
+   BELOW the ceiling proved equally false ("only 9 photos" for a 303-review clinic). */
+placesModeSetup();
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+let sentP = JSON.stringify(anthropicCalls[0].messages);
+assert("T15a no photo line reaches the model", !/Photos on profile/i.test(sentP));
+assert("T15b no photo count in any form", !/\bphotos?\b[^\n"]{0,40}\b\d+/i.test(sentP), "photo figure present");
+assert("T15c photos not even requested from Places", !/places\.photos/.test(placesFieldMask));
+assert("T15d real profile data still reaches the model", /Rating: 4\.7 \(132 reviews\)/.test(sentP));
+
+/* T15e (B8): listed details are never described as accurate or verified. */
+assert("T15e model instructed not to assert accuracy", /NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE/.test(anthropicCalls[0].system));
+placesModeTeardown();
+
+/* T16 (B4): the site's outbound social links are observable from the homepage HTML. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const sentSite = JSON.stringify(anthropicCalls[0].messages);
+assert("T16a site social-link observation reaches the model", /SITE SOCIAL LINKS/.test(sentSite));
+assert("T16b absence of social links is stated plainly", /no link to any social profile was found/i.test(sentSite), "site mock has no social links");
+
+/* T13: a Google Maps SEARCH url is not a profile and must be labelled as such */
+r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE,
+  google: "https://www.google.com/maps/search/bayou+city+dermatology+houston/@29.74,-95.44,11z" } });
+const byG = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T13a Maps search → UNAVAILABLE", byG.GOOGLE_PROFILE.status === "UNAVAILABLE");
+assert("T13b reason names the real problem", /search, not a business profile/i.test(byG.GOOGLE_PROFILE.reason));
+
+/* T14: deep-page discovery follows service/pricing pages and skips blog/legal */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const deepPages = r.body.source_log.filter(s => /^SITE_PAGE_/.test(s.label));
+const deepUrls = deepPages.map(s => s.url).join(" ");
+assert("T14a deep pages retrieved", deepPages.length > 0 && deepPages.every(s => s.status === "RETRIEVED"), `got ${deepPages.length}`);
+assert("T14b priority-service page followed", /\/botox/.test(deepUrls), deepUrls);
+assert("T14c blog and legal pages skipped", !/\/blog|\/privacy/.test(deepUrls), deepUrls);
+assert("T14d off-domain links never followed", !/elsewhere\.example\.net/.test(deepUrls));
+assert("T14e deep-page content reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("$12 per unit"));
+assert("T14f deep pages capped", deepPages.length <= 2);
+assert("T14g raw html never returned to the client", r.body.source_log.every(s => !("raw" in s)));
+
+/* T19 (B9): internal source labels must never reach the buyer. CP0 run #4 shipped
+   "SITE_PAGE_1" into a quick win and two plan days. The prompt forbids it AND the
+   validator rewrites any that survive - tested here by forcing them into the model output. */
+modelReportOverride = JSON.parse(JSON.stringify(GOOD_REPORT));
+modelReportOverride.quickWins = [
+  "Add a price anchor to SITE_PAGE_1 above the CTA",
+  "Fix the CTA on WEBSITE", "c", "d", "e",
+];
+modelReportOverride.plan = [
+  "Day 1 Update SITE_PAGE_1", "Day 2 Review BOOKING", "Day 3 x", "Day 4 x",
+  "Day 5 x", "Day 6 x", "Day 7 x",
+];
+modelReportOverride.leaks[0].fix = "Add the anchor to SITE_PAGE_1.";
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const visible = JSON.stringify([r.body.report.quickWins, r.body.report.plan, r.body.report.leaks.map(l => l.fix)]);
+assert("T19a no SITE_PAGE label in customer-facing copy", !/SITE_PAGE_\d/.test(visible), visible.slice(0, 120));
+assert("T19b no WEBSITE/BOOKING label in customer-facing copy", !/\b(WEBSITE|BOOKING|GOOGLE_PROFILE|SOCIAL)\b/.test(visible));
+assert("T19c label replaced with the real page name", /Botox Treatments page/i.test(visible), visible.slice(0, 200));
+assert("T19d repair recorded in validation notes", r.body.validation_notes.some(n => /source labels/i.test(n)));
+assert("T19e leak.sources still carries raw labels for badges", r.body.report.leaks.some(l => (l.sources || []).length > 0));
+modelReportOverride = null;
+
+/* T19f: the model is instructed not to write labels in the first place. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+assert("T19f prompt forbids internal labels in visible text", /NEVER WRITE AN INTERNAL SOURCE LABEL/.test(anthropicCalls[0].system));
 
 /* T6: score arithmetic enforced */
 modelReportOverride = JSON.parse(JSON.stringify(GOOD_REPORT)); modelReportOverride.score = 90; modelReportOverride.rating = "Strong";
@@ -211,6 +332,30 @@ anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: { ...INTAKE, ideal: "x".repeat(5000), evil_extra: "payload" } });
 assert("T10b oversized field truncated + unknown fields dropped", r.statusCode === 200 && !JSON.stringify(anthropicCalls.at(-1)).includes("payload") && !JSON.stringify(anthropicCalls.at(-1)).includes("x".repeat(801)));
 
+/* T17 (B5): a same-name profile at a DIFFERENT location must be discarded. Reporting
+   another suite's rating and hours as this owner's profile is worse than no data. */
+globalThis.__placesMode = () => "wronglocation";
+process.env.PLACES_API_KEY = "TEST_PLACES_KEY";
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+let byL = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T17a same-name different-city profile discarded", byL.GOOGLE_PROFILE.status === "UNAVAILABLE", `got ${byL.GOOGLE_PROFILE.status}`);
+assert("T17b wrong-location data never reaches the model", !JSON.stringify(anthropicCalls[0].messages).includes("Sugar Land"));
+
+/* T17c: the correct location still resolves normally. */
+globalThis.__placesMode = () => "match";
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+byL = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
+assert("T17c matching city still RETRIEVED", byL.GOOGLE_PROFILE.status === "RETRIEVED");
+
+/* T18 (B6): absent Places fields are stated as unknown, never as a business deficiency. */
+anthropicCalls = [];
+r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
+const sentA = JSON.stringify(anthropicCalls[0].messages);
+assert("T18a absent hours not shouted as a deficiency", !/NO HOURS ON PROFILE/.test(sentA));
+assert("T18b absent hours framed as unknown", /Hours listed: not returned by the data source/.test(sentA));
+delete process.env.PLACES_API_KEY;
+
 /* T11: optional Google Places retriever for GBP */
 let placesMode = "match"; // match | mismatch | error
 globalThis.__placesMode = () => placesMode;
@@ -219,7 +364,7 @@ anthropicCalls = [];
 r = await call({ license_key: "GOOD-KEY", intake: INTAKE });
 let byP = Object.fromEntries(r.body.source_log.map(s => [s.label, s]));
 assert("T11a key set + name match → GOOGLE_PROFILE RETRIEVED via Places", byP.GOOGLE_PROFILE?.status === "RETRIEVED");
-assert("T11b live profile data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("Rating: 4.7 (132 reviews)") && JSON.stringify(anthropicCalls[0].messages).includes("NO HOURS ON PROFILE"));
+assert("T11b live profile data reaches the model", JSON.stringify(anthropicCalls[0].messages).includes("Rating: 4.7 (132 reviews)") && /Hours listed: not returned by the data source/.test(JSON.stringify(anthropicCalls[0].messages)));
 assert("T11c source log preserves the supplied GBP url", byP.GOOGLE_PROFILE.url === INTAKE.google);
 
 placesMode = "mismatch";

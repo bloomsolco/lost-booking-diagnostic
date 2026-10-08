@@ -27,6 +27,18 @@ const MAX_BODY_BYTES = 600 * 1024;   // per source, raw
 const MAX_SOURCE_CHARS = 9000;       // per source, extracted text passed to the model
 const MIN_USEFUL_CHARS = 180;        // below this, treat as dynamically unreadable
 
+/* Platforms that redirect datacenter traffic to a login wall no matter how clean the
+   profile URL is (confirmed live for Instagram: the canonical profile 302s straight back
+   to /accounts/login/). Fetching them burns a request to produce an UNAVAILABLE row that
+   reads like a product defect. We skip the fetch, say plainly why, and recover the signal
+   that actually matters — whether the site links to social at all — from the site HTML. */
+const UNREADABLE_SOCIAL_HOST_RE = /(^|\.)(instagram\.com|facebook\.com|tiktok\.com)$/i;
+
+function isUnreadableSocialHost(rawUrl) {
+  try { return UNREADABLE_SOCIAL_HOST_RE.test(new URL(rawUrl).hostname); }
+  catch { return false; }
+}
+
 const SCORECARD_SPEC = [
   ["First Impression Clarity", 15],
   ["Service Clarity", 15],
@@ -80,14 +92,49 @@ export default async function handler(req, res) {
 
     /* ---- 3. Real public-source retrieval with server-truth source log ---- */
     const gbpViaPlaces = await tryPlacesGbp(d); // null unless PLACES_API_KEY set + confident name match
+    const social = normalizeSocialUrl(d.social);
+    const googleIsSearch = isGoogleSearchNotProfile(d.google);
+
     const fetchList = [
       { label: "WEBSITE", url: d.website },
       { label: "BOOKING", url: d.booking },
-      ...(gbpViaPlaces ? [] : [{ label: "GOOGLE_PROFILE", url: d.google }]),
-      ...(d.social && d.social !== "Not provided" ? [{ label: "SOCIAL", url: d.social }] : []),
+      ...(gbpViaPlaces || googleIsSearch ? [] : [{ label: "GOOGLE_PROFILE", url: d.google }]),
+      ...(social.url && !isUnreadableSocialHost(social.url) ? [{ label: "SOCIAL", url: social.url }] : []),
     ];
     const fetched = await retrieveSources(fetchList);
-    const sourceLog = gbpViaPlaces ? [...fetched.slice(0, 2), gbpViaPlaces, ...fetched.slice(2)] : fetched;
+
+    /* Social platforms that block automated review get an explicit, non-defect-sounding
+       row rather than a fetch failure. Findings about social must come from intake. */
+    const socialSkipped = social.url && isUnreadableSocialHost(social.url)
+      ? [{
+          label: "SOCIAL", url: social.url, status: "UNAVAILABLE", text: "",
+          reason: "This platform blocks automated review, so the profile was not opened. Social findings come from your intake answers.",
+        }]
+      : [];
+
+    /* A Maps search URL never had profile content to read. Say that, rather than
+       reporting a generic Maps blurb as though the profile were reviewed. */
+    const gbpEntry = gbpViaPlaces || (googleIsSearch ? {
+      label: "GOOGLE_PROFILE", url: d.google, status: "UNAVAILABLE",
+      reason: "Link is a Google Maps search, not a business profile page", text: "",
+    } : null);
+    const withGbp = gbpEntry ? [...fetched.slice(0, 2), gbpEntry, ...fetched.slice(2)] : fetched;
+    const base = [...withGbp, ...socialSkipped];
+
+    /* Deep-page discovery (BSC-010): the homepage rarely contains the service and pricing
+       language a buyer is actually evaluated on. Follow up to two same-domain pages that
+       look like service/pricing/about pages so findings can cite what the clinic really
+       says, not merely that a page appears to be missing. */
+    const deep = await retrieveDeepPages(base, d);
+
+    /* Fold the site's outbound-social observation into the WEBSITE source text. */
+    const siteEntry = base.find(s => s.label === "WEBSITE" && s.status === "RETRIEVED" && s.raw);
+    if (siteEntry) {
+      siteEntry.text = `${describeSiteSocialLinks(siteEntry.raw)}\n\n${siteEntry.text}`.slice(0, MAX_SOURCE_CHARS);
+    }
+
+    const sourceLog = [...base, ...deep];
+
     const fullLabels = sourceLog.filter(s => s.status === "RETRIEVED").map(s => s.label);
     const partialLabels = sourceLog.filter(s => s.status === "PARTIAL").map(s => s.label);
     const citableLabels = [...fullLabels, ...partialLabels];
@@ -123,7 +170,7 @@ export default async function handler(req, res) {
     } catch (e) {
       return res.status(502).json({ error: "The report could not be read cleanly. Please try again." });
     }
-    const v = validateAndRepairReport(report, citableLabels);
+    const v = validateAndRepairReport(report, citableLabels, sourceLog);
     if (!v.ok) return res.status(422).json({ error: v.error });
 
     return res.status(200).json({
@@ -225,6 +272,64 @@ function htmlToText(html) {
     .trim();
 }
 
+/* ---- URL normalization (BSC-010) ----
+   Owners paste whatever their browser gave them. Two observed failure modes:
+   (a) Instagram logged-out copy yields .../accounts/login/?next=%2Fhandle%2F — the handle
+       is present but the URL is a login wall, so retrieval dies on a link that contains
+       exactly what we need;
+   (b) Google yields a Maps *search* URL rather than a place page, which has no profile
+       content to read.
+   Normalizing first turns both into something retrievable (or correctly identifies (b)
+   as not-a-profile so the Places path is used instead of pretending we read something). */
+
+function normalizeSocialUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s || s === "Not provided") return { url: "", handle: "" };
+
+  // Bare handle: "@clinic" or "clinic"
+  if (/^@?[A-Za-z0-9._]{1,30}$/.test(s) && !s.includes(".com")) {
+    const h = s.replace(/^@/, "");
+    return { url: `https://www.instagram.com/${h}/`, handle: h };
+  }
+
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`); }
+  catch { return { url: s, handle: "" }; }
+
+  const RESERVED = /^(accounts|explore|reels|p|direct|login|signup|privacy|terms)$/i;
+
+  /* Login wall: the profile the owner meant is hiding in ?next=. This is host-generic
+     on purpose — the same pattern shows up across platforms, and the redirect target
+     is the only part that identifies the business. */
+  const next = u.searchParams.get("next");
+  if (next) {
+    let path = next;
+    try { path = decodeURIComponent(next); } catch {}
+    let host = u.hostname;
+    try {
+      if (/^https?:\/\//i.test(path)) { const nu = new URL(path); host = nu.hostname; path = nu.pathname; }
+    } catch {}
+    const h = (path.match(/^\/?([A-Za-z0-9._]{1,30})\/?/) || [])[1];
+    if (h && !RESERVED.test(h)) return { url: `https://${host}/${h}/`, handle: h };
+  }
+
+  // Already a clean profile path
+  const h = (u.pathname.match(/^\/([A-Za-z0-9._]{1,30})\/?$/) || [])[1];
+  if (h && !RESERVED.test(h)) return { url: `https://${u.hostname}/${h}/`, handle: h };
+
+  return { url: u.href, handle: "" };
+}
+
+/* A Google Maps *search* URL is a query, not a business profile. Flagging it lets the
+   source log say so plainly instead of reporting a generic Maps blurb as a review. */
+function isGoogleSearchNotProfile(raw) {
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`); }
+  catch { return false; }
+  if (!/google\./i.test(u.hostname)) return false;
+  return /\/maps\/search\//i.test(u.pathname) || /\/search/i.test(u.pathname);
+}
+
 function looksLoginGated(text) {
   const t = text.slice(0, 2500).toLowerCase();
   return /(log ?in|sign ?in|sign ?up) to (see|view|continue|use|access)|(log ?in|sign ?in) to [a-z]{1,20} to (see|continue)|create an account to|enable javascript|javascript is (required|disabled)|checking your browser|verify you are human|access denied|you must be logged in|please (log ?in|sign ?in)/.test(t);
@@ -282,6 +387,23 @@ function extractPreviewMetadata(html) {
   if (fields.site) lines.push(`Platform: ${fields.site}`);
   if (fields.description) lines.push(`Preview description: ${fields.description}`);
   return lines.join("\n");
+}
+
+/* B9: derive a page name a clinic owner would recognise. <title> first, falling back to
+   the final path segment title-cased. Trailing site-name suffixes ("| Clinic Name") are
+   trimmed so the name stays short enough to sit inside a 30-word finding. */
+function pageTitle(html, url) {
+  let t = "";
+  const m = String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (m) t = decodeEntities(m[1]).replace(/\s+/g, " ").split(/\s[|\u2013\u2014-]\s/)[0].trim();
+  if (!t || t.length > 70) {
+    try {
+      const seg = new URL(url).pathname.split("/").filter(Boolean).pop() || "";
+      t = seg.replace(/\.\w+$/, "").replace(/[-_]+/g, " ").trim();
+      t = t ? t.replace(/\b\w/g, c => c.toUpperCase()) : "";
+    } catch { t = ""; }
+  }
+  return t.slice(0, 70);
 }
 
 async function fetchOneSource(label, rawUrl) {
@@ -355,6 +477,10 @@ async function fetchOneSource(label, rawUrl) {
     entry.status = "RETRIEVED";
     entry.reason = "";
     entry.url = currentUrl;
+    /* B9: a readable page name so findings can say "the Botox page" instead of leaking
+       our internal source label into customer-facing copy. */
+    entry.title = pageTitle(raw, currentUrl);
+    entry.raw = raw; // kept in-process only for deep-page link discovery; never returned
     entry.text = text.slice(0, MAX_SOURCE_CHARS);
     return entry;
   }
@@ -366,14 +492,119 @@ async function retrieveSources(list) {
   return Promise.all(list.map(s => fetchOneSource(s.label, s.url)));
 }
 
+/* ---- Deep-page discovery (BSC-010) ----
+   A homepage tells you almost nothing about whether the priority service is sellable.
+   The pages that decide a booking — the service page, the pricing page — are one click
+   down. We follow at most two, same-domain only, ranked by how well the link text and
+   href match the owner's stated priority service and commercial intent words. Same SSRF
+   guards and caps as any other source; failures are silent and non-fatal. */
+const MAX_DEEP_PAGES = 2;
+
+function extractSameDomainLinks(html, baseUrl) {
+  let base;
+  try { base = new URL(baseUrl); } catch { return []; }
+  const out = [];
+  const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,200}?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html)) && out.length < 300) {
+    let href = m[1];
+    if (/^(#|mailto:|tel:|javascript:)/i.test(href)) continue;
+    let u;
+    try { u = new URL(href, base); } catch { continue; }
+    if (u.hostname !== base.hostname) continue;
+    if (!/^https?:$/.test(u.protocol)) continue;
+    if (/\.(pdf|jpg|jpeg|png|gif|webp|svg|mp4|zip|doc|docx)$/i.test(u.pathname)) continue;
+    u.hash = "";
+    const anchor = htmlToText(m[2]).slice(0, 120);
+    out.push({ url: u.href, anchor, path: u.pathname.toLowerCase() });
+  }
+  return out;
+}
+
+function scoreDeepLink(link, d, baseUrl) {
+  const svcWords = String(d.service || "").toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 3);
+  const hay = `${link.path} ${link.anchor.toLowerCase()}`;
+  let score = 0;
+  for (const w of svcWords) if (hay.includes(w)) score += 6;          // the money service
+  if (/\bprice|pricing|cost|fees|rates|specials|membership|financing/.test(hay)) score += 5;
+  if (/\bservice|treatment|procedure|menu\b/.test(hay)) score += 3;
+  if (/\bconsult/.test(hay)) score += 3;
+  if (/\babout|team|provider|staff|doctor|injector/.test(hay)) score += 2;
+  if (/\bfaq|result|before|gallery|review|testimonial/.test(hay)) score += 2;
+  if (/\bblog|news|career|privacy|terms|accessibility|contact|login|cart|account/.test(hay)) score -= 6;
+  try { if (new URL(link.url).href.replace(/\/$/, "") === new URL(baseUrl).href.replace(/\/$/, "")) score -= 20; }
+  catch {}
+  const depth = link.path.split("/").filter(Boolean).length;
+  if (depth > 3) score -= 2;
+  return score;
+}
+
+/* ---- Site social-link detection (BSC-010 B4) ----
+   We cannot read the social profile itself, but we CAN observe whether the site points to
+   it at all. "Your homepage never links to your Instagram" is a real, checkable leak for a
+   business whose discovery happens on social — and it costs nothing, since the homepage
+   HTML is already in hand. Appended to the WEBSITE source so it stays properly OBSERVED. */
+const SOCIAL_LINK_PATTERNS = [
+  ["Instagram", /instagram\.com\/[A-Za-z0-9._]/i],
+  ["Facebook", /facebook\.com\/[A-Za-z0-9._]/i],
+  ["TikTok", /tiktok\.com\/@?[A-Za-z0-9._]/i],
+  ["YouTube", /youtube\.com\/(@|channel\/|c\/)/i],
+];
+
+function describeSiteSocialLinks(html) {
+  const found = SOCIAL_LINK_PATTERNS.filter(([, re]) => re.test(html)).map(([n]) => n);
+  return found.length
+    ? `SITE SOCIAL LINKS: the site links out to ${found.join(", ")}.`
+    : "SITE SOCIAL LINKS: no link to any social profile was found anywhere in the homepage HTML.";
+}
+
+async function retrieveDeepPages(base, d) {
+  const site = base.find(s => s.label === "WEBSITE" && s.status === "RETRIEVED" && s.raw);
+  if (!site) return [];
+  const already = new Set(base.filter(s => s.url).map(s => String(s.url).replace(/\/$/, "")));
+
+  const seen = new Set();
+  const candidates = [];
+  for (const link of extractSameDomainLinks(site.raw, site.url)) {
+    const key = link.url.replace(/\/$/, "");
+    if (seen.has(key) || already.has(key)) continue;
+    seen.add(key);
+    candidates.push({ ...link, score: scoreDeepLink(link, d, site.url) });
+  }
+  const picks = candidates.filter(c => c.score > 3).sort((a, b) => b.score - a.score).slice(0, MAX_DEEP_PAGES);
+  if (!picks.length) return [];
+
+  const results = await Promise.all(
+    picks.map((p, i) => fetchOneSource(`SITE_PAGE_${i + 1}`, p.url).catch(() => null))
+  );
+  // Only surface pages we actually read; a failed guess is noise, not evidence.
+  return results.filter(r => r && r.status === "RETRIEVED").map(r => { delete r.raw; return r; });
+}
+
 /* ---- Optional Google Places retriever for the GBP source ----
    Enabled only when PLACES_API_KEY is set in Vercel env vars (founder-provisioned,
    quota-capped). One Text Search call resolves the business by name + location and
-   returns live profile data (rating, review count, hours, website, photos) — turning
+   returns live profile data (rating, review count, hours, website) — turning
    GOOGLE_PROFILE into a fully OBSERVED source. Guards: the returned business name
    must confidently match the intake business name, otherwise we discard the result
    and fall back to the normal fetch path (PARTIAL/UNAVAILABLE). Any API error also
    falls back. Absence of the key = exactly the pre-existing behavior. */
+/* ---- B5 (Places audit): location guard ----
+   namesMatch alone is not sufficient. A multi-location brand ("Queen Aesthetics") returns
+   a perfect name match for a DIFFERENT suite, and we would then report another location's
+   rating, review count, hours and address as this owner's profile. That is worse than
+   returning nothing. We therefore also require the resolved address to contain the city
+   the owner gave. Deliberately biased toward false negatives: a nearby-suburb address
+   ("Bellaire" for a Houston intake) is discarded and falls back to UNAVAILABLE, which
+   costs us a source but never attributes a stranger's data to the customer. */
+function locationMatches(address, intakeLocation) {
+  const norm = s => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+  const addr = norm(address);
+  const city = norm(String(intakeLocation || "").split(",")[0]);
+  if (!addr || !city) return false;
+  return addr.includes(city);
+}
+
 function namesMatch(a, b) {
   const tok = s => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(w => w.length > 1);
   const A = tok(a), B = tok(b);
@@ -397,7 +628,7 @@ async function tryPlacesGbp(d) {
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": key,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.businessStatus,places.rating,places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,places.regularOpeningHours.weekdayDescriptions,places.photos.name",
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.businessStatus,places.rating,places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,places.regularOpeningHours.weekdayDescriptions",
       },
       body: JSON.stringify({ textQuery: `${d.business} ${d.location}`, pageSize: 1 }),
     });
@@ -410,6 +641,8 @@ async function tryPlacesGbp(d) {
   if (!p) return null;
   const foundName = p.displayName && p.displayName.text ? p.displayName.text : "";
   if (!namesMatch(foundName, d.business)) return null; // wrong business — never report a stranger's profile
+  // B5: same brand, different location is still the wrong profile for this owner.
+  if (!locationMatches(p.formattedAddress, d.location)) return null;
 
   const lines = [
     "GOOGLE BUSINESS PROFILE — live data via Google Places API:",
@@ -417,12 +650,23 @@ async function tryPlacesGbp(d) {
     p.businessStatus ? `Status: ${p.businessStatus}` : "",
     p.formattedAddress ? `Address: ${p.formattedAddress}` : "",
     (typeof p.rating === "number") ? `Rating: ${p.rating} (${p.userRatingCount || 0} reviews)` : "Rating: none shown on profile",
-    p.websiteUri ? `Website listed: ${p.websiteUri}` : "Website listed: NO WEBSITE LINK ON PROFILE",
+    /* B6: a field absent from the API response does not reliably mean the business
+       omitted it. The previous all-caps framing pushed the model toward a leak — the
+       same mechanism that produced B3. Absent means unknown, not deficient. */
+    p.websiteUri ? `Website listed: ${p.websiteUri}` : "Website listed: not returned by the data source — treat as unknown, not as a missing link.",
     p.nationalPhoneNumber ? `Phone listed: ${p.nationalPhoneNumber}` : "Phone listed: none",
     (p.regularOpeningHours && Array.isArray(p.regularOpeningHours.weekdayDescriptions) && p.regularOpeningHours.weekdayDescriptions.length)
-      ? `Hours listed: yes — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
-      : "Hours listed: NO HOURS ON PROFILE",
-    Array.isArray(p.photos) ? `Photos on profile: ${p.photos.length}` : "Photos on profile: none",
+      ? `Hours listed: yes (listed on the profile — we cannot verify they are correct) — ${p.regularOpeningHours.weekdayDescriptions.join("; ")}`
+      : "Hours listed: not returned by the data source — treat as unknown, not as missing hours.",
+    /* B7 (CP0 live, second occurrence): the photo line is GONE, and the field is no
+       longer even requested. Places returns a limited set of place photos; that count is
+       not the profile's photo total and excludes customer-uploaded images, which is most
+       of what a searcher actually sees. B3 tried to fix this with a ceiling rule, but a
+       value BELOW the ceiling is equally unreliable — proven when a clinic with 303
+       reviews was reported as having "only 9 photos". We cannot distinguish "few photos"
+       from "few photos exposed by the API" at ANY value, so the field cannot support a
+       finding and must never reach the model. Do not reintroduce without a source that
+       reports a true profile photo total. */
   ].filter(Boolean);
 
   return { label: "GOOGLE_PROFILE", url: d.google, status: "RETRIEVED", reason: "", text: lines.join("\n").slice(0, MAX_SOURCE_CHARS) };
@@ -435,14 +679,36 @@ function buildSystemPrompt(fullLabels, partialLabels) {
   const hasSources = citable.length > 0;
   return `You are Bloom Sol, a strategic digital growth and visibility diagnostic company for med spas, aesthetic clinics, and premium appointment-based local businesses. You are generating The Bloom Sol Lost Booking Diagnostic, reviewing the business from the perspective of a normal prospective client deciding whether to trust, contact, or book.
 
-This is NOT a full marketing strategy, SEO audit, website redesign, legal/medical/compliance review, analytics or ad audit, or revenue forecast. Never guarantee bookings, revenue, rankings, or outcomes. Never invent revenue figures, booking counts, ranking positions, ROI numbers, or performance results. Voice: clear, grounded, commercially sharp, calm, elegant, practical, anti-jargon. Every recommendation ties to booking friction, trust, clarity, confidence, next-step action, local discoverability, or conversion readiness.
+You are not a generalist. You are an operator who has diagnosed hundreds of aesthetics and elective-care businesses, and you write like someone who already knows how this industry converts. Bring that judgment to every finding:
+
+- ELECTIVE CASH-PAY BEHAVES DIFFERENTLY. These are discretionary, self-funded, appearance-related purchases. Price silence does not create intrigue; it creates exit. A visitor who cannot form a price expectation assumes "more than I want to spend" and leaves without contacting anyone. "Starting at" anchoring, ranges, and financing mentions convert better than "call for pricing".
+- THE FIRST BOOKING IS USUALLY A DECISION, NOT A TRANSACTION. High-consideration treatments convert through a consultation path; low-consideration or repeat services convert through direct booking. A clinic that funnels everything into one generic "Book Now" loses both: the nervous first-timer wants reassurance, the returning client wants speed.
+- TRUST IN AESTHETICS IS PERSON-SHAPED. Buyers choose an injector or provider, not a building. Named providers, credentials, faces, and their actual work outrank brand polish. A beautiful site with no visible human is a common and expensive gap.
+- PROOF MEANS OUTCOMES. Before/after imagery, specific results, and recent reviews do the persuading. Stock photography of unrelated models actively erodes trust with this audience.
+- A LONG TREATMENT MENU IS A DECISION BURDEN. Twenty services with no guided entry point produces stalling, not choice. "Not sure where to start" is a conversion problem with a known fix: a guided path, quiz, or named first-visit consultation.
+- OFF-SITE BOOKING TOOLS LEAK. Redirects to a third-party scheduler abandon the trust the site just built and offer no re-entry for a visitor who is not ready yet.
+- LOCAL DISCOVERY IS PART OF THE FUNNEL. For appointment-based local businesses the Google profile is often the real homepage. Review recency and volume, hours, and a working booking link carry disproportionate weight. (Photo volume is NOT observable through our sources — never comment on it.)
+- REPEAT ECONOMICS MATTER. Many of these services recur. A path that captures one appointment and no way to return leaves most of a client's value uncollected.
+
+Write findings that could only have been written about THIS business. Name what you actually saw: the specific service, the specific page, the specific wording. A finding that would read identically for any clinic is a weak finding — replace it with a sharper one grounded in the retrieved content. Prefer the diagnosis a seasoned operator would reach over the obvious observation anyone could make.
+
+This is NOT a full marketing strategy, SEO audit, website redesign, legal/medical/compliance review, analytics or ad audit, or revenue forecast. Never guarantee bookings, revenue, rankings, or outcomes. Never invent revenue figures, booking counts, ranking positions, ROI numbers, or performance results. Never state a price, rating, review count, or statistic that does not appear in the retrieved source content. Voice: clear, grounded, commercially sharp, calm, elegant, practical, anti-jargon. Every recommendation ties to booking friction, trust, clarity, confidence, next-step action, local discoverability, or conversion readiness.
+
+EXPERTISE NEVER OVERRIDES EVIDENCE. The industry knowledge above tells you what to look for and how to interpret it. It never licenses a claim about this business that the retrieved sources do not support. When your expertise suggests a likely problem you could not verify, either ground it in the owner's intake answers and label it INTAKE-REPORTED, or leave it out.
+
+NEVER WRITE AN INTERNAL SOURCE LABEL IN CUSTOMER-FACING TEXT. Labels such as WEBSITE, BOOKING, GOOGLE_PROFILE, SOCIAL and SITE_PAGE_1 exist only to tag evidence in the "sources" array. The reader is a clinic owner who has never seen them. In every visible field — interpretation, topLeaks, observed, hesitation, fix, quickWins, plan and the scorecard — refer to a page by its name or its role ("the Botox page", "your booking page", "your Google profile"), never by its label.
+
+NEVER ASSERT THAT LISTED INFORMATION IS ACCURATE. Sources can show that hours, a phone number or an address are PRESENT. They cannot show that those details are correct. Write "listed" or "shown", never "accurate", "correct", "up to date" or "verified". Likewise, when the same figure appears with different values from different sources, do not silently pick one: name the source for each, or use only the retrieved source.
+
+NEVER BUILD A FINDING ON A MEASUREMENT CEILING. Some source values are capped by the data source rather than by the business. Where a source says a value is capped, at least, or unknown, treat it as unknown — never as a low number, never as evidence of a deficiency, and never as one of the three leaks.
 
 EVIDENCE RULES — these are strict:
 - The user message contains source content for these sources only: FULL PAGE TEXT for [${fullLabels.join(", ") || "—"}]; PUBLIC PREVIEW METADATA ONLY for [${partialLabels.join(", ") || "—"}]. Sources marked UNAVAILABLE could not be read; you know nothing about their content.
 - A finding may be labeled basis "OBSERVED" ONLY when it describes something actually present in the provided source content, and it must list which of [${citable.join(", ") || "—"}] it came from.
 - For PREVIEW-METADATA sources, an OBSERVED finding may describe only what the preview itself shows (e.g. the bio text, follower count, or the absence of a booking link in the bio) — never anything about the page beyond the preview.
 - Anything grounded only in the owner's intake answers must be labeled basis "INTAKE-REPORTED" with sources [].
-- Never present an assumption or an unavailable source as an observation. Never describe the content of an UNAVAILABLE source.${hasSources ? "" : "\n- Since NO sources were readable, every leak must use basis \"INTAKE-REPORTED\" and the interpretation must state the review is based on the owner's answers only."}
+- Never present an assumption or an unavailable source as an observation. Never describe the content of an UNAVAILABLE source.
+- Do not build a leak out of our own retrieval limits. "Your Google profile could not be verified" describes our tooling, not the customer's business, and must never be one of the three leaks. If a source was unreadable, spend that leak on something you did observe.${hasSources ? "" : "\n- Since NO sources were readable, every leak must use basis \"INTAKE-REPORTED\" and the interpretation must state the review is based on the owner's answers only."}
 
 Scoring rubric (total 100): First Impression Clarity 15, Service Clarity 15, Booking Path 20, Trust And Proof 15, Google Profile Readiness 15, CTA And Lead Capture 15, Friction Reduction 5. Rating bands: 85-100 "Strong", 70-84 "Solid — leaks present", 55-69 "Notable friction", below 55 "High leakage". The score must equal the sum of the 7 scorecard numerators.
 
@@ -465,7 +731,9 @@ Area to pay closest attention to: ${d.focus}`;
 
   const sourceBlocks = sourceLog.map(s => {
     if (s.status === "RETRIEVED") {
-      return `=== SOURCE ${s.label} — RETRIEVED (${s.url}) ===\n${s.text}\n=== END ${s.label} ===`;
+      // B9: the page NAME is what the customer recognises; the label is internal plumbing.
+      const named = s.title ? `page name: "${s.title}" — ` : "";
+      return `=== SOURCE ${s.label} — RETRIEVED (${named}${s.url}) ===\n${s.text}\n=== END ${s.label} ===`;
     }
     if (s.status === "PARTIAL") {
       return `=== SOURCE ${s.label} — PREVIEW METADATA ONLY (${s.url}) — full page not readable; observe only what this preview shows ===\n${s.text}\n=== END ${s.label} ===`;
@@ -494,7 +762,27 @@ const BANNED_CLAIM_PATTERNS = [
   /\b(double|triple)\s+(your\s+)?(revenue|bookings?|sales)\b/i,
 ];
 
-function validateAndRepairReport(r, citableLabels) {
+/* B9: internal source labels must never appear in customer-facing copy. The prompt
+   forbids it, but prompts are requests, not guarantees - CP0 run #4 shipped "SITE_PAGE_1"
+   into a quick win and two plan days. This rewrites any label that survives into a
+   readable page reference, using the real page name where we captured one. Repair rather
+   than reject: the finding itself is sound, only the wording is wrong. */
+const LABEL_TEXT_RE = /\b(SITE_PAGE_\d+|GOOGLE_PROFILE|WEBSITE|BOOKING|SOCIAL)\b/g;
+
+function scrubSourceLabels(value, nameByLabel) {
+  if (typeof value === "string") {
+    return value.replace(LABEL_TEXT_RE, (lbl) => nameByLabel[lbl] || "that page");
+  }
+  if (Array.isArray(value)) return value.map(v => scrubSourceLabels(v, nameByLabel));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = scrubSourceLabels(v, nameByLabel);
+    return out;
+  }
+  return value;
+}
+
+function validateAndRepairReport(r, citableLabels, sourceLog) {
   const notes = [];
   if (!r || typeof r !== "object") return { ok: false, error: "Report was empty." };
 
@@ -544,6 +832,32 @@ function validateAndRepairReport(r, citableLabels) {
   if (retrieved.size === 0 && r.leaks.some(l => l.basis === "OBSERVED")) {
     return { ok: false, error: "Report failed validation: observation claims with no readable sources." };
   }
+
+  /* Scrub labels from visible fields only. leak.sources deliberately keeps the raw
+     labels - that array drives the badge rendering, not the prose. */
+  const nameByLabel = {};
+  for (const src of (sourceLog || [])) {
+    if (src.title) nameByLabel[src.label] = `the ${src.title} page`;
+    else if (src.label === "GOOGLE_PROFILE") nameByLabel[src.label] = "your Google profile";
+    else if (src.label === "BOOKING") nameByLabel[src.label] = "your booking page";
+    else if (src.label === "WEBSITE") nameByLabel[src.label] = "your website";
+    else if (src.label === "SOCIAL") nameByLabel[src.label] = "your social profile";
+  }
+  const before = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.quickWins, r.plan, r.scorecard, r.leaks.map(l => [l.name, l.observed, l.hesitation, l.fix])]);
+  r.interpretation = scrubSourceLabels(r.interpretation, nameByLabel);
+  r.topLeaks = scrubSourceLabels(r.topLeaks, nameByLabel);
+  r.fixFirst = scrubSourceLabels(r.fixFirst, nameByLabel);
+  r.quickWins = scrubSourceLabels(r.quickWins, nameByLabel);
+  r.plan = scrubSourceLabels(r.plan, nameByLabel);
+  r.scorecard = scrubSourceLabels(r.scorecard, nameByLabel);
+  for (const leak of r.leaks) {
+    leak.name = scrubSourceLabels(leak.name, nameByLabel);
+    leak.observed = scrubSourceLabels(leak.observed, nameByLabel);
+    leak.hesitation = scrubSourceLabels(leak.hesitation, nameByLabel);
+    leak.fix = scrubSourceLabels(leak.fix, nameByLabel);
+  }
+  const after = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.quickWins, r.plan, r.scorecard, r.leaks.map(l => [l.name, l.observed, l.hesitation, l.fix])]);
+  if (before !== after) notes.push("Internal source labels were rewritten as readable page references.");
 
   // Banned outcome claims — no invented revenue/booking/ranking/ROI results.
   const textPool = JSON.stringify([r.interpretation, r.topLeaks, r.fixFirst, r.leaks, r.quickWins, r.plan]);
