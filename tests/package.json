@@ -1,0 +1,12 @@
+{
+  "name": "lbd-tests",
+  "private": true,
+  "type": "module",
+  "description": "Test-only dependencies. Not deployed: Vercel reads the repo-root package.json, which does not exist.",
+  "scripts": {
+    "test": "node local-harness.mjs && node retention.test.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.3.16"
+  }
+}

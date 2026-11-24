@@ -1,0 +1,8 @@
+{
+  "git": {
+    "deploymentEnabled": { "bsc-030-report-retention": false }
+  },
+  "crons": [
+    { "path": "/api/report-admin", "schedule": "17 9 * * *" }
+  ]
+}

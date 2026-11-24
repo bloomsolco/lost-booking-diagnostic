@@ -163,10 +163,10 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       <p class="intro-2">No uploads. No screenshots. No logins. No patient information. No analytics. No ad account access.</p>
     </div>
 
-    <div class="q-block" id="licenseBlock" style="border:1.5px solid var(--rose)"><label class="q-label"><span class="q-num">★</span>Your license key <span class="req">*</span></label><p class="q-hint" id="licenseHint">From your Gumroad receipt after purchase. It's checked with Gumroad when your report is generated.</p><input type="text" id="license" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX"></div>
-    <div class="q-block" id="verifiedBlock" style="display:none;border:1.5px solid var(--rose);background:var(--wash)"><label class="q-label"><span class="q-num">★</span>License key applied</label><p class="q-hint" style="margin-bottom:0">Your license key was filled in automatically from your purchase link. It will be verified with Gumroad when your report is generated.</p></div>
+    <div class="q-block" id="licenseBlock" style="border:1.5px solid var(--rose)"><label class="q-label"><span class="q-num">★</span>Your license key <span class="req">*</span></label><p class="q-hint" id="licenseHint">From your Gumroad receipt after purchase. It's checked with Gumroad when your report is generated.</p><input type="text" id="license" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX"><p class="q-hint" style="margin:10px 0 0">Already generated your report? <a href="#" onclick="retrieveReport();return false" style="color:var(--rose-deep);font-weight:600">Retrieve my saved report</a> with this key.</p><p class="err-msg" id="retrieveMsg"></p></div>
+    <div class="q-block" id="verifiedBlock" style="display:none;border:1.5px solid var(--rose);background:var(--wash)"><label class="q-label"><span class="q-num">★</span>License key applied</label><p class="q-hint" style="margin-bottom:0">Your license key was filled in automatically from your purchase link. It will be verified with Gumroad when your report is generated.</p><p class="q-hint" style="margin:10px 0 0">Already generated your report? <a href="#" onclick="retrieveReport();return false" style="color:var(--rose-deep);font-weight:600">Retrieve my saved report</a>.</p></div>
     <div class="q-block"><label class="q-label"><span class="q-num">1.</span>Your name <span class="req">*</span></label><input type="text" id="name"></div>
-    <div class="q-block"><label class="q-label"><span class="q-num">2.</span>Email address <span class="req">*</span></label><p class="q-hint">Used for your Gumroad receipt and support. Your report renders on this screen — save it as a PDF when it's ready.</p><input type="email" id="email"></div>
+    <div class="q-block"><label class="q-label"><span class="q-num">2.</span>Email address <span class="req">*</span></label><p class="q-hint">Used for your Gumroad receipt and support. Your report renders on this screen. A copy of your answers and your report is kept for at least 90 days so you can open it again with your license key.</p><input type="email" id="email"></div>
     <div class="q-block"><label class="q-label"><span class="q-num">3.</span>Business name <span class="req">*</span></label><input type="text" id="business"></div>
     <div class="q-block"><label class="q-label"><span class="q-num">4.</span>Business location <span class="req">*</span></label><p class="q-hint">City and state</p><input type="text" id="location" placeholder="e.g. Houston, TX"></div>
     <div class="q-block"><label class="q-label"><span class="q-num">5.</span>Business type <span class="req">*</span></label>
@@ -216,7 +216,7 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
     <p class="err-msg" id="errMsg">Please complete all required fields marked with *</p>
     <button class="submit-btn" id="submitBtn" onclick="openReview()">Review my answers</button>
     <p style="text-align:center;font-size:12.5px;color:var(--ink-soft);margin-top:12px;margin-bottom:0">You'll get a chance to check everything before your report is generated.</p>
-    <p class="submit-micro">Public links only · Your report renders on screen</p>
+    <p class="submit-micro">Public links only · Your report renders on screen · Retrievable with your license key</p>
   </div>
 
   <!-- ===== REVIEW ===== -->
@@ -250,6 +250,7 @@ td.sc{font-family:'Cormorant Garamond',serif;font-weight:700;font-size:15px;whit
       </div>
     </div>
     <p class="save-hint">Your print dialog will open. Choose <b>Save as PDF</b> as the destination (on iPhone, tap Share then Save to Files).</p>
+    <p class="save-hint" id="keptNote" style="display:none"></p>
     <div class="save-banner" id="saveBanner">⚠️ Your report isn't saved yet — tap <b>Save as PDF</b> before you close this tab or switch apps.</div>
     <div class="doc" id="doc"></div>
     <div class="fail" id="failBox"></div>
@@ -290,8 +291,8 @@ function cycleMsgs(){let i=0;document.getElementById("loadMsg").textContent=load
 let reportSaved=false;
 const REPORT_KEY="bsd_last_report";
 
-function cacheReport(r,d,slog){
-  try{sessionStorage.setItem(REPORT_KEY,JSON.stringify({r,d,slog,ts:Date.now()}));}catch(e){}
+function cacheReport(r,d,slog,meta){
+  try{sessionStorage.setItem(REPORT_KEY,JSON.stringify({r,d,slog,meta,ts:Date.now()}));}catch(e){}
 }
 function clearCachedReport(){
   try{sessionStorage.removeItem(REPORT_KEY);}catch(e){}
@@ -332,8 +333,8 @@ window.addEventListener("beforeunload",function(e){
     try{
       const cached=sessionStorage.getItem(REPORT_KEY);
       if(cached){
-        const {r,d,slog}=JSON.parse(cached);
-        renderReport(r,d,slog||[],true);
+        const {r,d,slog,meta}=JSON.parse(cached);
+        renderReport(r,d,slog||[],true,meta||{});
       }
     }catch(e){}
   }
@@ -397,13 +398,50 @@ async function runDiagnostic(){
     if(!res.ok){
       const m=(j&&j.error)?j.error:("Server "+res.status);
       track("generation_failure",{code:res.status});
-      throw new Error(m);
+      const e=new Error(m);e.code=j&&j.code;e.final=j&&j.final;throw e;
     }
     track("generation_success");
-    renderReport(j.report,data,j.source_log||[]);
+    renderReport(j.report,j.intake||data,j.source_log||[],false,metaFrom(j));
   }catch(err){
     showFail(data,err);
   }finally{clearInterval(msgTimer);}
+}
+
+/* ===== BSC-030: stored-report retrieval. The license key is sent in a POST body only.
+   The server returns exactly what it stored, so the report is identical every time. ===== */
+function metaFrom(j){return {generated_at:j.generated_at||null,retained_until:j.retained_until||null,stored:j.stored!==false,warning:j.storage_warning||""};}
+
+async function retrieveReport(){
+  const key=val("license");const box=document.getElementById("retrieveMsg");
+  if(!key){if(box){box.textContent="Enter your license key first.";box.style.display="block";}return;}
+  if(box)box.style.display="none";
+  document.getElementById("formView").style.display="none";
+  document.getElementById("loading").style.display="block";
+  document.getElementById("loadMsg").textContent="Opening your saved report";
+  try{
+    const res=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({license_key:key,action:"retrieve"})});
+    let j=null;try{j=await res.json();}catch(_){}
+    if(!res.ok){const e=new Error((j&&j.error)||("Server "+res.status));e.code=j&&j.code;throw e;}
+    track("report_retrieve");
+    reportSaved=false;
+    renderReport(j.report,j.intake,j.source_log||[],false,metaFrom(j));
+  }catch(err){
+    document.getElementById("loading").style.display="none";
+    document.getElementById("formView").style.display="block";
+    if(box){box.textContent=String(err&&err.message||err);box.style.display="block";}
+  }
+}
+
+async function deleteStoredReport(){
+  const key=val("license");
+  if(!key){alert("Enter your license key on the intake form first.");return;}
+  if(!confirm("Permanently delete the stored copy of your answers and report? You won't be able to retrieve or regenerate it with this key. Save a PDF first if you want to keep it."))return;
+  try{
+    const res=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({license_key:key,action:"delete"})});
+    let j=null;try{j=await res.json();}catch(_){}
+    const n=document.getElementById("keptNote");
+    if(n){n.style.display="block";n.textContent=res.ok?"Your stored copy was deleted. This page still shows the report until you close it.":((j&&j.error)||"Deletion failed — please try again.");}
+  }catch(e){alert("Deletion failed — please try again.");}
 }
 
 function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
@@ -411,11 +449,18 @@ function impactClass(v){v=(v||"").toLowerCase();return v.startsWith("high")?"hig
 
 function sourceName(lbl){if(/^SITE_PAGE_/.test(lbl))return "Site page";return {WEBSITE:"Website",BOOKING:"Booking page",GOOGLE_PROFILE:"Google Business Profile",SOCIAL:"Social profile"}[lbl]||lbl;}
 
-function renderReport(r,d,slog,fromCache){
-  slog=slog||[];
-  if(!fromCache){reportSaved=false;cacheReport(r,d,slog);}
+function renderReport(r,d,slog,fromCache,meta){
+  slog=slog||[];meta=meta||{};d=d||{};
+  if(!fromCache){reportSaved=false;cacheReport(r,d,slog,meta);}
   const circ=2*Math.PI*52, off=circ*(1-(r.score/100));
-  const today=new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
+  const fmt=t=>new Date(t).toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
+  const today=meta.generated_at?fmt(meta.generated_at):fmt(Date.now());
+  const kn=document.getElementById("keptNote");
+  if(kn){
+    if(meta.warning){kn.textContent=meta.warning;kn.style.display="block";}
+    else if(meta.retained_until){kn.innerHTML=`A copy is kept until <b>${esc(fmt(meta.retained_until))}</b> — reopen it any time with your license key. <a href="#" onclick="deleteStoredReport();return false" style="color:var(--ink-soft)">Delete my stored copy</a>`;kn.style.display="block";}
+    else kn.style.display="none";
+  }
   const rows=r.scorecard.map(s=>{
     const isLeak=parseInt(s.score)/parseInt(s.score.split("/")[1])<0.7;
     return `<tr><td style="font-weight:600">${esc(s.category)}</td><td class="sc ${isLeak?'leaking':'work'}">${esc(s.score)}</td><td class="work">${esc(s.working)||"—"}</td><td class="leaking">${esc(s.leaking)||"—"}</td></tr>`;
@@ -475,7 +520,15 @@ function showFail(d,err){
   document.getElementById("report").style.display="block";
   document.getElementById("doc").style.display="none";
   const fb=document.getElementById("failBox");fb.style.display="block";
-  fb.innerHTML=`<b>The report couldn't be generated just now.</b><br>This is usually a temporary connection issue. Please try again in a moment.<br><br><button class="btn-solid" onclick="restart()">Try again</button><br><br><span style="font-size:12px;color:var(--ink-soft)">Details: ${esc(String(err&&err.message||err))}</span>`;
+  const code=err&&err.code;
+  const terminal=code==="attempts_exhausted"||code==="deleted"||code==="expired"||(err&&err.final);
+  if(code==="in_progress"){
+    fb.innerHTML=`<b>Your report is already being generated.</b><br>${esc(err.message)}<br><br><button class="btn-solid" onclick="restart()">Back</button>`;
+  }else if(terminal){
+    fb.innerHTML=`<b>We couldn't produce a report for this purchase.</b><br>${esc(err.message)}`;
+  }else{
+    fb.innerHTML=`<b>The report couldn't be generated just now.</b><br>This is usually a temporary connection issue. Please try again in a moment.<br><br><button class="btn-solid" onclick="restart()">Try again</button><br><br><span style="font-size:12px;color:var(--ink-soft)">Details: ${esc(String(err&&err.message||err))}</span>`;
+  }
 }
 
 function restart(){

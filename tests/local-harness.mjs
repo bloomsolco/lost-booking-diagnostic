@@ -2,6 +2,9 @@
 // Mocks Gumroad, the Anthropic API and public-source fetches so no generation,
 // license use, or external traffic is consumed. Asserts the CP0-testable behaviors.
 
+import { createFakeSupabase, FAKE_URL, FAKE_KEY } from "./fake-supabase.mjs";
+const supa = await createFakeSupabase(); // BSC-030: storage is required before generation
+
 let anthropicCalls = [];
 let gumroadMode = "valid"; // valid | invalid | refunded | chargebacked
 let sourceMode = "mixed";  // mixed: website OK, booking OK, google 302->login, social timeout
@@ -37,6 +40,7 @@ function anthropicBody(report) {
 
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
+  if (u.startsWith(FAKE_URL)) return supa.handle(u, opts);
   if (u.includes("places.googleapis.com")) {
     const mode = globalThis.__placesMode ? globalThis.__placesMode() : "match";
     if ((opts.headers || {})["X-Goog-Api-Key"] !== "TEST_PLACES_KEY") return json(403, { error: { message: "invalid key" } });
@@ -112,6 +116,8 @@ function json(status, obj) { return new Response(JSON.stringify(obj), { status, 
 function html(status, body) { return new Response(body, { status, headers: { "content-type": "text/html" } }); }
 
 process.env.ANTHROPIC_API_KEY = "TEST_SERVER_KEY";
+process.env.SUPABASE_URL = FAKE_URL;
+process.env.SUPABASE_SERVICE_KEY = FAKE_KEY;
 const { default: handler } = await import("../api/diagnostic.js");
 
 function makeRes() {
@@ -128,7 +134,11 @@ const INTAKE = {
   google: "https://example.net/gprofile", social: "https://example.org/ig",
   service: "Botox", ideal: "Professional women 30-55", problem: "Website visitors are not booking", focus: "Booking path",
 };
-async function call(body) { const res = makeRes(); await handler({ method: "POST", headers: { origin: "https://diagnostic.bloomsol.co" }, body }, res); return res; }
+/* BSC-030: one purchase now yields one stored report and later calls replay it. These
+   pre-existing checks are about FRESH generation, so each call uses its own test key.
+   Replay, retrieval and retention are covered in tests/retention.test.mjs. */
+let keySeq = 0;
+async function call(body) { body = { ...body, license_key: `${body.license_key}-${++keySeq}` }; const res = makeRes(); await handler({ method: "POST", headers: { origin: "https://diagnostic.bloomsol.co" }, body }, res); return res; }
 
 function placesModeSetup() { globalThis.__placesMode = () => "match"; process.env.PLACES_API_KEY = "TEST_PLACES_KEY"; }
 function placesModeTeardown() { delete process.env.PLACES_API_KEY; }

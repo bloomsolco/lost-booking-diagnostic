@@ -9,14 +9,17 @@
 //   4. Call the Anthropic Messages API with a server-side key only.
 //   5. Validate the report (structure, score arithmetic, source traceability, banned
 //      outcome claims) before returning it.
+//   6. BSC-030: claim the purchase before any model spend, store inputs + report together,
+//      replay the stored report on repeat calls, cap attempts, end failures in a final state.
 // ANTHROPIC_API_KEY stays in Vercel env vars. It is never sent to, or readable by, the client.
 
 import dns from "node:dns/promises";
 import net from "node:net";
+import { verifyGumroadLicense, readLicenseKey, applyCors } from "./_lib/gumroad.js";
+import * as store from "./_lib/report-store.js";
 
 /* ============================== CONSTANTS ============================== */
 
-const GUMROAD_PRODUCT_ID = "yyzm9n6iAxsrLx2LbmW0AA=="; // not a secret — public product identifier
 const MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 8000;
 const TEMPERATURE = 0.4;
@@ -67,19 +70,16 @@ const REQUIRED_INTAKE = ["name","email","business","location","type","website","
 /* ============================== HANDLER ============================== */
 
 export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
-  const allowed = /^https:\/\/(diagnostic\.bloomsol\.co|bloomsol\.co|[a-z0-9-]+\.vercel\.app)$/.test(origin);
-  res.setHeader("Access-Control-Allow-Origin", allowed ? origin : "https://diagnostic.bloomsol.co");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  applyCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
+  let claimed = null; // { reportId, attempt } once this request holds the generation claim
   try {
     /* ---- 1. Bounded payload: license_key + intake only. Everything else ignored. ---- */
     const body = req.body || {};
-    const licenseKey = typeof body.license_key === "string" ? body.license_key.trim() : "";
-    if (!licenseKey || licenseKey.length > 100) {
+    const licenseKey = readLicenseKey(body);
+    if (!licenseKey) {
       return res.status(400).json({ error: "A license key from your Gumroad receipt is required." });
     }
     const intake = sanitizeIntake(body.intake);
@@ -90,6 +90,94 @@ export default async function handler(req, res) {
     const lic = await verifyGumroadLicense(licenseKey);
     if (!lic.valid) return res.status(lic.status).json({ error: lic.error });
 
+    /* ---- 2b. BSC-030 claim. Runs BEFORE any source fetch or model call, so a storage
+       outage never spends a generation that could not be kept. ---- */
+    if (!store.storeConfigured()) {
+      return res.status(503).json({ error: STORAGE_DOWN_MSG, code: "storage_unavailable" });
+    }
+    const inputs = store.buildInputs(d);
+    let c;
+    try {
+      c = await store.claim({
+        hash: store.licenseHash(licenseKey), productId: lic.productId, saleId: lic.saleId, inputs,
+      });
+    } catch (e) {
+      return res.status(503).json({ error: STORAGE_DOWN_MSG, code: "storage_unavailable" });
+    }
+    const early = claimDecisionResponse(c);
+    if (early) return res.status(early.status).json(early.body);
+    claimed = { reportId: c.report_id, attempt: c.attempt, maxAttempts: c.max_attempts };
+
+    const out = await generateReport(d);
+    if (!out.ok) {
+      const f = await recordFailure(claimed, out.reason);
+      return res.status(out.status).json({ error: out.error, ...attemptsInfo(f) });
+    }
+
+    /* ---- 6. Save report into the row that already holds its inputs ---- */
+    const stored = store.buildStoredReport({ ...out.payload, model: MODEL });
+    let saved = null;
+    try { saved = await store.complete({ reportId: claimed.reportId, attempt: claimed.attempt, stored }); }
+    catch { saved = null; }
+    if (!saved || saved.ok !== true) {
+      /* The report exists but could not be kept. Show it (the buyer paid for it) and say
+         plainly that no copy was kept; the record ends in a failed state, not limbo. */
+      await recordFailure(claimed, "storage_write_failed");
+      claimed = null;
+      return res.status(200).json({
+        verified: true, stored: false,
+        storage_warning: "We couldn't keep a copy of this report. Save it as a PDF now — it can't be retrieved later.",
+        generated_at: stored.generated_at, intake: d,
+        report: stored.report, source_log: stored.source_log, validation_notes: stored.validation_notes,
+      });
+    }
+    claimed = null;
+    // Built from the record as stored (not the in-memory copy) => identical to every retrieval.
+    return res.status(200).json(store.reportResponse(saved));
+  } catch (err) {
+    if (claimed) await recordFailure(claimed, "unexpected_error");
+    return res.status(500).json({ error: "Unexpected server error. Please try again." });
+  }
+}
+
+const STORAGE_DOWN_MSG = "Report storage is temporarily unavailable, so no report was generated and your license key was not used. Please try again in a few minutes.";
+
+/* Map a non-generate claim decision to the buyer-facing response. */
+function claimDecisionResponse(c) {
+  switch (c && c.decision) {
+    case "generate": return null;
+    case "replay":
+      return { status: 200, body: { ...store.reportResponse(c), replayed: true } };
+    case "in_progress":
+      return { status: 409, body: { code: "in_progress", error: "Your report is already being generated. Please wait a few minutes, then use \"Retrieve my report\" with your license key." } };
+    case "exhausted":
+      return { status: 409, body: { code: "attempts_exhausted", error: "We couldn't generate a report for this purchase after several attempts. Please reply to your Gumroad receipt email and we'll sort it out." } };
+    case "deleted":
+      return { status: 410, body: { code: "deleted", error: "The report for this license key was deleted and cannot be regenerated. Please reply to your Gumroad receipt email if this is unexpected." } };
+    case "expired":
+      return { status: 410, body: { code: "expired", error: "The report for this license key is past its storage period. Please reply to your Gumroad receipt email." } };
+    default:
+      return { status: 503, body: { code: "storage_unavailable", error: STORAGE_DOWN_MSG } };
+  }
+}
+
+async function recordFailure(claimed, reason) {
+  if (!claimed) return null;
+  try { return await store.fail({ reportId: claimed.reportId, attempt: claimed.attempt, reason }); }
+  catch { return null; } // left pending; the next claim after STALE_ATTEMPT_SECONDS closes it out
+}
+
+function attemptsInfo(f) {
+  if (!f || f.ok !== true) return {};
+  return f.status === "failed_final"
+    ? { code: "attempts_exhausted", attempts_remaining: 0, final: true }
+    : { attempts_remaining: f.attempts_remaining, final: false };
+}
+
+/* Steps 3–5, unchanged in substance: retrieve sources, call the model, validate.
+   Returns { ok:true, payload } or { ok:false, status, error, reason }. */
+async function generateReport(d) {
+  {
     /* ---- 3. Real public-source retrieval with server-truth source log ---- */
     const gbpViaPlaces = await tryPlacesGbp(d); // null unless PLACES_API_KEY set + confident name match
     const social = normalizeSocialUrl(d.social);
@@ -157,10 +245,10 @@ export default async function handler(req, res) {
     });
     const apiData = await anthropicRes.json();
     if (!anthropicRes.ok) {
-      return res.status(502).json({ error: "The report engine is temporarily unavailable. Please try again in a moment." });
+      return { ok: false, status: 502, reason: `model_http_${anthropicRes.status}`, error: "The report engine is temporarily unavailable. Please try again in a moment." };
     }
     if (apiData.stop_reason === "max_tokens") {
-      return res.status(502).json({ error: "The report came back incomplete. Please try again." });
+      return { ok: false, status: 502, reason: "model_max_tokens", error: "The report came back incomplete. Please try again." };
     }
 
     /* ---- 5. Parse + validate before returning anything ---- */
@@ -168,19 +256,19 @@ export default async function handler(req, res) {
     try {
       report = parseModelJson(apiData);
     } catch (e) {
-      return res.status(502).json({ error: "The report could not be read cleanly. Please try again." });
+      return { ok: false, status: 502, reason: "model_unparseable", error: "The report could not be read cleanly. Please try again." };
     }
     const v = validateAndRepairReport(report, citableLabels, sourceLog);
-    if (!v.ok) return res.status(422).json({ error: v.error });
+    if (!v.ok) return { ok: false, status: 422, reason: "validation_failed", error: v.error };
 
-    return res.status(200).json({
-      verified: true,
-      report: v.report,
-      source_log: sourceLog.map(({ label, url, status, reason }) => ({ label, url, status, reason })),
-      validation_notes: v.notes,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: "Unexpected server error. Please try again." });
+    return {
+      ok: true,
+      payload: {
+        report: v.report,
+        source_log: sourceLog.map(({ label, url, status, reason }) => ({ label, url, status, reason })),
+        validation_notes: v.notes,
+      },
+    };
   }
 }
 
@@ -200,33 +288,7 @@ function sanitizeIntake(raw) {
   return { ok: true, data };
 }
 
-/* ============================== GUMROAD ============================== */
-
-async function verifyGumroadLicense(licenseKey) {
-  let r, j;
-  try {
-    r = await fetch("https://api.gumroad.com/v2/licenses/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        product_id: GUMROAD_PRODUCT_ID,
-        license_key: licenseKey,
-        increment_uses_count: "false", // non-consuming: internal QA must not burn uses
-      }),
-    });
-    j = await r.json();
-  } catch (e) {
-    return { valid: false, status: 502, error: "Purchase verification is temporarily unavailable. Please try again in a moment." };
-  }
-  if (!j || j.success !== true || !j.purchase) {
-    return { valid: false, status: 403, error: "That license key was not recognized for this product. Check your Gumroad receipt and try again." };
-  }
-  const p = j.purchase;
-  if (p.refunded) return { valid: false, status: 403, error: "This purchase was refunded, so a report can no longer be generated with this key." };
-  if (p.chargebacked) return { valid: false, status: 403, error: "This purchase is not in good standing, so a report cannot be generated with this key." };
-  if (p.disputed && !p.dispute_won) return { valid: false, status: 403, error: "This purchase is under dispute, so a report cannot be generated right now." };
-  return { valid: true };
-}
+/* Gumroad verification lives in api/_lib/gumroad.js (shared with api/report.js). */
 
 /* ============================== SOURCE RETRIEVAL ============================== */
 
